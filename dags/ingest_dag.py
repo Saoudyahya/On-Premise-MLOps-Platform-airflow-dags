@@ -34,7 +34,7 @@ with DAG(
     dag_id="ingest_dag",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule_interval=None,
+    schedule=None,              # ← was schedule_interval
     catchup=False,
     tags=["ingestion"],
 ) as dag:

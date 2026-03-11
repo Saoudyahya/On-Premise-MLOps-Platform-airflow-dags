@@ -42,7 +42,7 @@ def poll_until_ready(username, **ctx):
         r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=HEADERS)
         r.raise_for_status()
         server = r.json().get("server")
-        if server and r.json().get("server", {}) != {}:
+        if server and server != {}:
             print(f"Server ready: {JUPYTERHUB_URL}/user/{username}/lab")
             return
         time.sleep(5)
@@ -52,7 +52,7 @@ with DAG(
     dag_id="launch_notebook_dag",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule_interval=None,
+    schedule=None,              # ← was schedule_interval
     catchup=False,
     tags=["notebook"],
 ) as dag:
@@ -60,28 +60,9 @@ with DAG(
     username = "{{ dag_run.conf['username'] }}"
     profile  = "{{ dag_run.conf.get('profile', 'CPU — 4 cores, 16GB RAM') }}"
 
-    t1 = PythonOperator(
-        task_id="check_user_exists",
-        python_callable=check_user_exists,
-        op_kwargs={"username": username},
-    )
-
-    t2 = PythonOperator(
-        task_id="stop_stale_server",
-        python_callable=stop_stale_server,
-        op_kwargs={"username": username},
-    )
-
-    t3 = PythonOperator(
-        task_id="spawn_server",
-        python_callable=spawn_server,
-        op_kwargs={"username": username, "profile": profile},
-    )
-
-    t4 = PythonOperator(
-        task_id="poll_until_ready",
-        python_callable=poll_until_ready,
-        op_kwargs={"username": username},
-    )
+    t1 = PythonOperator(task_id="check_user_exists", python_callable=check_user_exists, op_kwargs={"username": username})
+    t2 = PythonOperator(task_id="stop_stale_server", python_callable=stop_stale_server, op_kwargs={"username": username})
+    t3 = PythonOperator(task_id="spawn_server", python_callable=spawn_server, op_kwargs={"username": username, "profile": profile})
+    t4 = PythonOperator(task_id="poll_until_ready", python_callable=poll_until_ready, op_kwargs={"username": username})
 
     t1 >> t2 >> t3 >> t4
