@@ -4,93 +4,134 @@ from datetime import datetime
 import boto3
 import subprocess
 import os
+import logging
 
-default_args = {"owner": "mlops", "retries": 1}
-
-
-def stage_raw_file(dataset, researcher_id, **ctx):
-    """Upload the raw file to S3 under the researcher's own prefix."""
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=os.environ["AWS_ENDPOINT_URL"],
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    )
-    s3_key = f"{researcher_id}/{dataset}"          # e.g. "alice/train.csv"
-    s3.upload_file(f"/data/incoming/{dataset}", "mlops-raw", s3_key)
-    print(f"Staged s3://mlops-raw/{s3_key}")
-    ctx["ti"].xcom_push(key="s3_key", value=s3_key)
+logger = logging.getLogger(__name__)
+default_args = {"owner": "mlops", "retries": 0}
 
 
 def dvc_add(dataset, researcher_id, **ctx):
-    """
-    Copy the incoming file into the researcher's scoped folder inside the
-    DVC workspace, then track it with `dvc add`.
+    logger.info("=" * 50)
+    logger.info(f"Starting dvc_add for {researcher_id}/{dataset}")
+    logger.info(f"AWS_ENDPOINT_URL: {os.environ.get('AWS_ENDPOINT_URL', 'NOT SET')}")
+    logger.info(f"AWS_ACCESS_KEY_ID: {os.environ.get('AWS_ACCESS_KEY_ID', 'NOT SET')}")
 
-    Resulting layout:
-        dvc-workspace/
-          data/
-            <researcher_id>/
-              <dataset>          ← tracked by DVC
-              <dataset>.dvc      ← DVC pointer file
-    """
     workspace = "/opt/airflow/dvc-workspace"
-    dest_dir  = os.path.join(workspace, "data", researcher_id)
-    os.makedirs(dest_dir, exist_ok=True)
+    s3_path   = f"s3://mlops-dvc/{researcher_id}/{dataset}"
 
-    src  = f"/data/incoming/{dataset}"
-    dest = os.path.join(dest_dir, dataset)
+    # Check workspace exists
+    if not os.path.exists(workspace):
+        logger.error(f"DVC workspace not found at {workspace}")
+        raise FileNotFoundError(f"DVC workspace not found: {workspace}")
+    logger.info(f"Workspace found: {workspace}")
 
-    # Copy only if the file isn't already in the workspace
-    if not os.path.exists(dest):
-        import shutil
-        shutil.copy2(src, dest)
-        print(f"Copied {src} → {dest}")
+    # Check DVC is installed
+    result = subprocess.run(["which", "dvc"], capture_output=True, text=True)
+    logger.info(f"DVC path: {result.stdout.strip() or 'NOT FOUND'}")
 
-    dvc_path = os.path.join("data", researcher_id, dataset)   # relative to workspace
-    subprocess.run(
-        ["dvc", "add", dvc_path],
-        check=True,
-        cwd=workspace,
+    # Check DVC remote config
+    result = subprocess.run(
+        ["dvc", "remote", "list"],
+        capture_output=True, text=True, cwd=workspace
     )
-    print(f"DVC tracking: {dvc_path}")
-    ctx["ti"].xcom_push(key="dvc_path", value=dvc_path)
+    logger.info(f"DVC remotes: {result.stdout.strip() or 'NONE CONFIGURED'}")
+    if result.stderr:
+        logger.warning(f"DVC remote list stderr: {result.stderr}")
+
+    # Check file exists in MinIO before tracking
+    logger.info(f"Checking MinIO for: {s3_path}")
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        )
+        s3.head_object(Bucket="mlops-dvc", Key=f"{researcher_id}/{dataset}")
+        logger.info(f"File found in MinIO: mlops-dvc/{researcher_id}/{dataset}")
+    except Exception as e:
+        logger.error(f"File NOT found in MinIO: {e}")
+        raise
+
+    # Run dvc add --external
+    logger.info(f"Running: dvc add --external {s3_path}")
+    result = subprocess.run(
+        ["dvc", "add", "--external", s3_path],
+        capture_output=True, text=True, cwd=workspace
+    )
+    logger.info(f"dvc add stdout: {result.stdout}")
+    if result.stderr:
+        logger.warning(f"dvc add stderr: {result.stderr}")
+    if result.returncode != 0:
+        logger.error(f"dvc add failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, "dvc add", result.stderr)
+
+    dvc_file = f"{researcher_id}/{dataset}.dvc"
+    logger.info(f"DVC tracking complete: {dvc_file}")
+    ctx["ti"].xcom_push(key="dvc_file", value=dvc_file)
 
 
 def git_commit(dataset, researcher_id, **ctx):
-    """
-    Commit the generated .dvc pointer file so the DVC lineage is captured
-    in Git.  Uses a no-op if there is nothing to commit (idempotent).
-    """
-    workspace  = "/opt/airflow/dvc-workspace"
-    dvc_path   = ctx["ti"].xcom_pull(key="dvc_path")
-    dvc_file   = f"{dvc_path}.dvc"
-    gitignore   = os.path.join("data", researcher_id, ".gitignore")
+    logger.info("=" * 50)
+    logger.info(f"Starting git_commit for {researcher_id}/{dataset}")
 
-    subprocess.run(["git", "config", "user.email", "airflow@mlops"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "user.name",  "Airflow"],       cwd=workspace, check=True)
-    subprocess.run(["git", "add", dvc_file, gitignore],              cwd=workspace, check=True)
+    workspace = "/opt/airflow/dvc-workspace"
+    dvc_file  = ctx["ti"].xcom_pull(key="dvc_file")
+    gitignore = os.path.join(researcher_id, ".gitignore")
+
+    logger.info(f"DVC file to commit: {dvc_file}")
+
+    # Check git status
+    result = subprocess.run(
+        ["git", "status"], capture_output=True, text=True, cwd=workspace
+    )
+    logger.info(f"Git status:\n{result.stdout}")
+
+    for cmd in [
+        ["git", "config", "user.email", "airflow@mlops"],
+        ["git", "config", "user.name", "Airflow"],
+    ]:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=workspace)
+        logger.info(f"Ran: {' '.join(cmd)} → rc={result.returncode}")
 
     result = subprocess.run(
-        ["git", "commit", "-m",
-         f"[ingest] {researcher_id}/{dataset} – tracked by DVC"],
-        cwd=workspace,
-        capture_output=True,
-        text=True,
+        ["git", "add", dvc_file, gitignore],
+        capture_output=True, text=True, cwd=workspace
     )
-    if result.returncode not in (0, 1):   # 1 = nothing to commit → fine
+    logger.info(f"git add → rc={result.returncode} stdout={result.stdout} stderr={result.stderr}")
+
+    result = subprocess.run(
+        ["git", "commit", "-m", f"[ingest] {researcher_id}/{dataset}"],
+        capture_output=True, text=True, cwd=workspace
+    )
+    logger.info(f"git commit stdout: {result.stdout}")
+    if result.stderr:
+        logger.warning(f"git commit stderr: {result.stderr}")
+    if result.returncode not in (0, 1):
+        logger.error(f"git commit failed: rc={result.returncode}")
         raise subprocess.CalledProcessError(result.returncode, "git commit", result.stderr)
-    print(result.stdout or "Nothing new to commit.")
+
+    logger.info("git_commit complete")
 
 
-def dvc_push(**ctx):
-    """Push all cached data to the DVC remote (MinIO / S3)."""
-    subprocess.run(
-        ["dvc", "push"],
-        check=True,
-        cwd="/opt/airflow/dvc-workspace",
+def git_push(**ctx):
+    logger.info("=" * 50)
+    logger.info("Starting git_push")
+
+    workspace = "/opt/airflow/dvc-workspace"
+
+    result = subprocess.run(
+        ["git", "push"],
+        capture_output=True, text=True, cwd=workspace
     )
-    print("DVC push complete.")
+    logger.info(f"git push stdout: {result.stdout}")
+    if result.stderr:
+        logger.warning(f"git push stderr: {result.stderr}")
+    if result.returncode != 0:
+        logger.error(f"git push failed: rc={result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, "git push", result.stderr)
+
+    logger.info("git_push complete")
 
 
 with DAG(
@@ -100,51 +141,26 @@ with DAG(
     schedule=None,
     catchup=False,
     tags=["ingestion"],
-    doc_md="""
-## ingest_dag
-
-Ingests a raw dataset file and tracks it with DVC, **scoped per researcher**.
-
-### Trigger parameters (`dag_run.conf`)
-| key             | required | example            | description                          |
-|-----------------|----------|--------------------|--------------------------------------|
-| `dataset`       | ✅       | `"train.csv"`      | Filename present in `/data/incoming/`|
-| `researcher_id` | ✅       | `"alice"`          | Researcher username / unique ID      |
-
-### What it does
-1. **stage_raw_file** – uploads `/data/incoming/<dataset>` to  
-   `s3://mlops-raw/<researcher_id>/<dataset>`
-2. **dvc_add** – places the file under  
-   `dvc-workspace/data/<researcher_id>/<dataset>` and runs `dvc add`
-3. **git_commit** – commits the `.dvc` pointer file so lineage is in Git
-4. **dvc_push** – pushes data to the DVC remote (MinIO)
-""",
 ) as dag:
 
     dataset       = "{{ dag_run.conf['dataset'] }}"
     researcher_id = "{{ dag_run.conf['researcher_id'] }}"
 
     t1 = PythonOperator(
-        task_id="stage_raw_file",
-        python_callable=stage_raw_file,
-        op_kwargs={"dataset": dataset, "researcher_id": researcher_id},
-    )
-
-    t2 = PythonOperator(
         task_id="dvc_add",
         python_callable=dvc_add,
         op_kwargs={"dataset": dataset, "researcher_id": researcher_id},
     )
 
-    t3 = PythonOperator(
+    t2 = PythonOperator(
         task_id="git_commit",
         python_callable=git_commit,
         op_kwargs={"dataset": dataset, "researcher_id": researcher_id},
     )
 
-    t4 = PythonOperator(
-        task_id="dvc_push",
-        python_callable=dvc_push,
+    t3 = PythonOperator(
+        task_id="git_push",
+        python_callable=git_push,
     )
 
-    t1 >> t2 >> t3 >> t4
+    t1 >> t2 >> t3
