@@ -51,48 +51,6 @@ def get_jupyterhub_token() -> str:
     )
 
 
-def stop_stale_server(username, **ctx):
-    logger.info(f"=== TASK: stop_stale_server | user={username} ===")
-
-    token   = get_jupyterhub_token()
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-
-    logger.info(f"Checking if user '{username}' exists in JupyterHub...")
-    r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
-
-    if r.status_code == 404:
-        logger.info(f"User '{username}' does not exist yet — nothing to stop")
-        return
-
-    r.raise_for_status()
-    user_data = r.json()
-    logger.info(f"User found. Raw server data: {user_data.get('servers', {})}")
-
-    servers = user_data.get("servers", {})
-    if not servers:
-        logger.info("No running servers found — nothing to stop")
-        return
-
-    for name, server_info in servers.items():
-        ready   = server_info.get("ready", False)
-        pending = server_info.get("pending")
-        logger.info(f"  Server '{name}': ready={ready}, pending={pending}")
-
-        if ready:
-            logger.info(f"  Server '{name}' is healthy — leaving it alone")
-        else:
-            logger.info(f"  Server '{name}' is stuck (pending={pending}) — stopping it")
-            del_r = requests.delete(
-                f"{JUPYTERHUB_API}/users/{username}/servers/{name}",
-                headers=headers,
-                timeout=10,
-            )
-            logger.info(f"  Delete response: {del_r.status_code}")
-            time.sleep(3)
-
-    logger.info("=== stop_stale_server DONE ===")
-
-
 def spawn_server(username, **ctx):
     logger.info(f"=== TASK: spawn_server | user={username} ===")
 
@@ -188,8 +146,7 @@ with DAG(
 
     username = "{{ dag_run.conf['username'] }}"
 
-    t1 = PythonOperator(task_id="stop_stale_server", python_callable=stop_stale_server, op_kwargs={"username": username})
-    t2 = PythonOperator(task_id="spawn_server",      python_callable=spawn_server,      op_kwargs={"username": username})
-    t3 = PythonOperator(task_id="poll_until_ready",  python_callable=poll_until_ready,  op_kwargs={"username": username})
+    t1 = PythonOperator(task_id="spawn_server",     python_callable=spawn_server,     op_kwargs={"username": username})
+    t2 = PythonOperator(task_id="poll_until_ready", python_callable=poll_until_ready, op_kwargs={"username": username})
 
-    t1 >> t2 >> t3
+    t1 >> t2
