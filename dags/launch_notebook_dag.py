@@ -8,43 +8,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-JUPYTERHUB_URL = "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80"
-JUPYTERHUB_API = f"{JUPYTERHUB_URL}/hub/api"
+# ── FIX 1: Use the hub service directly, NOT proxy-public ──────────────────────
+# proxy-public:80  → user-facing CHP proxy  (for browser traffic)
+# hub:8081         → Hub API               (for programmatic API calls)
+# Calling /hub/api through proxy-public fails with 404 when the user doesn't
+# exist yet because CHP has no route registered for that user.
+JUPYTERHUB_HUB_URL    = "http://hub.mlops-jupyterhub.svc.cluster.local:8081"
+JUPYTERHUB_PUBLIC_URL = "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80"
+JUPYTERHUB_API        = f"{JUPYTERHUB_HUB_URL}/hub/api"
 
 
 def get_jupyterhub_token() -> str:
-    """
-    Fetch a fresh JupyterHub admin API token.
-    First tries JUPYTERHUB_ADMIN_TOKEN env var.
-    Falls back to creating one via the hub's internal sqlite DB.
-    """
-    # ── Option 1: token already set as env var ──────────────────────────────
     token = os.environ.get("JUPYTERHUB_ADMIN_TOKEN", "").strip()
     if token:
         logger.info("✓ Using JUPYTERHUB_ADMIN_TOKEN from environment")
         return token
-
-    # ── Option 2: generate one via JupyterHub token API (no token needed) ──
-    # This works because JupyterHub exposes a token endpoint for services
-    logger.info("JUPYTERHUB_ADMIN_TOKEN not set — attempting to generate one via hub API")
-
-    hub_token_url = f"{JUPYTERHUB_API}/authorizations/token"
-    hub_user      = os.environ.get("JUPYTERHUB_ADMIN_USER",     "admin")
-    hub_password  = os.environ.get("JUPYTERHUB_ADMIN_PASSWORD", "")
-
-    if hub_password:
-        logger.info(f"Requesting token for user '{hub_user}' via password auth")
-        r = requests.post(
-            hub_token_url,
-            json={"username": hub_user, "password": hub_password},
-            timeout=10,
-        )
-        r.raise_for_status()
-        token = r.json().get("token", "")
-        if token:
-            logger.info("✓ Token obtained via password auth")
-            return token
-
     raise RuntimeError(
         "Could not obtain a JupyterHub token. "
         "Set JUPYTERHUB_ADMIN_TOKEN env var in your Airflow deployment."
@@ -57,7 +35,7 @@ def spawn_server(username, **ctx):
     token   = get_jupyterhub_token()
     headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
-    # Check if already running
+    # ── Step 1: Check if user exists ────────────────────────────────────────────
     logger.info(f"Checking current server state for '{username}'...")
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
 
@@ -67,12 +45,30 @@ def spawn_server(username, **ctx):
             if server_info.get("ready"):
                 logger.info(f"Server '{name}' already running and ready — skipping spawn")
                 return
-        logger.info(f"User exists but no ready server found — spawning now")
+        logger.info("User exists but no ready server found — proceeding to spawn")
+
     elif r.status_code == 404:
-        logger.info(f"User '{username}' does not exist — JupyterHub will create it on spawn")
+        # ── FIX 2: Create user first before spawning ─────────────────────────────
+        # JupyterHub requires the user to exist in its DB before a server can be
+        # spawned via POST /hub/api/users/{username}/server.
+        # POST /hub/api/users/{username}/server on a non-existent user → 404.
+        logger.info(f"User '{username}' does not exist — creating user first...")
+        r_create = requests.post(
+            f"{JUPYTERHUB_API}/users/{username}",
+            headers=headers,
+            json={},
+            timeout=10,
+        )
+        logger.info(f"User creation response: {r_create.status_code}")
+        if r_create.status_code not in (200, 201):
+            logger.error(f"Failed to create user: {r_create.status_code} — {r_create.text}")
+            r_create.raise_for_status()
+        logger.info(f"✓ User '{username}' created")
+
     else:
         r.raise_for_status()
 
+    # ── Step 2: Spawn the server ────────────────────────────────────────────────
     logger.info(f"Sending spawn request for '{username}'...")
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/server",
@@ -86,6 +82,9 @@ def spawn_server(username, **ctx):
         logger.info("Server created immediately (201)")
     elif r.status_code == 202:
         logger.info("Spawn accepted, server is starting (202)")
+    elif r.status_code == 400:
+        # Server already exists / is already spawning
+        logger.info(f"Server already exists or is spawning (400) — {r.text}")
     else:
         logger.error(f"Unexpected response: {r.status_code} — {r.text}")
         r.raise_for_status()
@@ -114,7 +113,8 @@ def poll_until_ready(username, **ctx):
                 pending = server_info.get("pending")
                 logger.info(f"  Server '{name}': ready={ready}, pending={pending}")
                 if ready:
-                    url = f"{JUPYTERHUB_URL}/user/{username}/lab"
+                    # Use proxy-public URL for the final user-facing link
+                    url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/lab"
                     logger.info(f"✓ Server is ready → {url}")
                     ctx["ti"].xcom_push(key="server_url", value=url)
                     logger.info("=== poll_until_ready DONE ===")
@@ -122,7 +122,7 @@ def poll_until_ready(username, **ctx):
 
         # Legacy single-server API
         elif isinstance(user_data.get("server"), str) and user_data["server"]:
-            url = f"{JUPYTERHUB_URL}/user/{username}/lab"
+            url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/lab"
             logger.info(f"✓ Server ready (legacy API) → {url}")
             ctx["ti"].xcom_push(key="server_url", value=url)
             logger.info("=== poll_until_ready DONE ===")
