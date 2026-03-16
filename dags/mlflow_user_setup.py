@@ -1,4 +1,6 @@
 # dags/mlflow_user_setup.py
+# SIMPLIFIED: only provisions the MLflow user account.
+# Experiment + model registry are created by the researcher from their notebook.
 
 import secrets
 import psycopg2
@@ -7,10 +9,9 @@ from datetime import datetime
 from airflow.sdk import dag, task
 
 MLFLOW_URL = "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000"
-ADMIN_AUTH = ("admin", "mlops-admin-2024")
+ADMIN_USER = "admin"
+ADMIN_PASS = "mlops-admin-2024"   # must match auth.ini → admin_password
 
-# Same PostgreSQL that MLflow uses — researcher credentials live in a
-# separate table so Airflow Variables are never involved.
 DB_DSN = (
     "host=mlflow-postgresql-svc.mlops-mlflow.svc.cluster.local "
     "port=5432 "
@@ -21,17 +22,8 @@ DB_DSN = (
 )
 
 
-def _get_db():
-    return psycopg2.connect(DB_DSN)
-
-
 def _upsert_credentials(researcher_id: str, username: str, password: str) -> None:
-    """
-    Insert or update researcher credentials in the researcher_credentials table.
-    On conflict (same researcher_id) update password + updated_at so re-running
-    the DAG rotates the password instead of crashing.
-    """
-    with _get_db() as conn:
+    with psycopg2.connect(DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -49,7 +41,7 @@ def _upsert_credentials(researcher_id: str, username: str, password: str) -> Non
 
 @dag(
     dag_id="mlflow_user_setup",
-    description="Create MLflow user, experiment and model registry for a researcher",
+    description="Provision an MLflow user account for a researcher",
     schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
@@ -59,114 +51,80 @@ def _upsert_credentials(researcher_id: str, username: str, password: str) -> Non
 def mlflow_user_setup():
 
     @task
-    def create_user(**context):
+    def create_mlflow_user(**context):
         username = context["params"]["username"]
         password = secrets.token_urlsafe(16)
 
+        # ── 1. Verify admin credentials are actually working ───────────────────
+        # Probe the admin user endpoint first — cheap read that confirms auth.
+        # If this 403s, the ADMIN_PASS in this file doesn't match auth.ini.
+        probe = requests.get(
+            f"{MLFLOW_URL}/api/2.0/mlflow/users/get",
+            params={"username": ADMIN_USER},
+            auth=(ADMIN_USER, ADMIN_PASS),
+            timeout=10,
+        )
+        if probe.status_code == 403:
+            raise RuntimeError(
+                "Admin credentials rejected by MLflow (403). "
+                "Verify ADMIN_PASS matches auth.ini → admin_password on the MLflow pod.\n"
+                "Quick check:\n"
+                "  kubectl exec -n mlops-mlflow deploy/mlflow -- "
+                "  curl -su admin:mlops-admin-2024 "
+                "  http://localhost:5000/api/2.0/mlflow/users/get?username=admin"
+            )
+        print(f"✅ Admin auth probe: HTTP {probe.status_code}")
+
+        # ── 2. Create researcher user (or rotate password if they exist) ───────
         r = requests.post(
             f"{MLFLOW_URL}/api/2.0/mlflow/users/create",
             json={"username": username, "password": password},
-            auth=ADMIN_AUTH,
+            auth=(ADMIN_USER, ADMIN_PASS),
+            timeout=10,
         )
-        r.raise_for_status()
-        print(f"✅ MLflow user created: {username}")
 
-        # ── Persist in PostgreSQL (not Airflow Variables) ──────────────────────
+        if r.status_code == 200:
+            print(f"✅ MLflow user created: {username}")
+
+        elif r.status_code == 409:
+            # User already exists — rotate the password so re-running the DAG
+            # always produces fresh credentials rather than silently failing.
+            print(f"⚠️  User '{username}' already exists — rotating password")
+            r2 = requests.patch(
+                f"{MLFLOW_URL}/api/2.0/mlflow/users/update-password",
+                json={"username": username, "password": password},
+                auth=(ADMIN_USER, ADMIN_PASS),
+                timeout=10,
+            )
+            r2.raise_for_status()
+            print(f"✅ Password rotated for: {username}")
+
+        else:
+            # Surface the MLflow error body to make debugging easier
+            raise RuntimeError(
+                f"MLflow /users/create returned {r.status_code}: {r.text}"
+            )
+
+        # ── 3. Persist in PostgreSQL ───────────────────────────────────────────
         _upsert_credentials(
             researcher_id=username,
             username=username,
             password=password,
         )
-        print(f"✅ Credentials stored in PostgreSQL → researcher_credentials")
+        print("✅ Credentials stored in researcher_credentials (mlflow PostgreSQL)")
+
+        print("=" * 60)
+        print(f"  Researcher : {username}")
+        print(f"  Password   : {password}")
+        print(f"  Fetch creds: GET /api/mlflow/credentials/{username}")
+        print()
+        print("  The researcher creates their own experiment and model")
+        print("  registry from the notebook — no admin action needed.")
+        print("=" * 60)
 
         return {"username": username, "password": password}
 
-    @task
-    def create_experiment(user_info: dict):
-        username = user_info["username"]
-
-        r = requests.post(
-            f"{MLFLOW_URL}/api/2.0/mlflow/experiments/create",
-            json={"name": username},
-            auth=ADMIN_AUTH,
-        )
-        r.raise_for_status()
-        exp_id = r.json()["experiment_id"]
-        print(f"✅ Experiment created: {username} (id={exp_id})")
-
-        requests.post(
-            f"{MLFLOW_URL}/api/2.0/mlflow/experiments/permissions/create",
-            json={
-                "experiment_id": exp_id,
-                "username":      username,
-                "permission":    "MANAGE",
-            },
-            auth=ADMIN_AUTH,
-        ).raise_for_status()
-        print("✅ Experiment MANAGE permission granted")
-
-        return {**user_info, "exp_id": exp_id}
-
-    @task
-    def create_model_registry(user_info: dict):
-        username   = user_info["username"]
-        model_name = f"{username}_models"
-
-        r = requests.post(
-            f"{MLFLOW_URL}/api/2.0/mlflow/registered-models/create",
-            json={"name": model_name},
-            auth=ADMIN_AUTH,
-        )
-        if r.status_code == 400:
-            print(f"⚠️  Model registry '{model_name}' already exists — skipping")
-        else:
-            r.raise_for_status()
-            print(f"✅ Model registry created: {model_name}")
-
-        requests.post(
-            f"{MLFLOW_URL}/api/2.0/mlflow/registered-models/permissions/create",
-            json={
-                "name":       model_name,
-                "username":   username,
-                "permission": "MANAGE",
-            },
-            auth=ADMIN_AUTH,
-        ).raise_for_status()
-        print("✅ Model registry MANAGE permission granted")
-
-        return user_info
-
-    @task
-    def print_summary(user_info: dict):
-        username = user_info["username"]
-
-        # Re-read from DB so the summary reflects what was actually stored
-        with _get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT mlflow_password FROM researcher_credentials "
-                    "WHERE researcher_id = %s",
-                    (username,),
-                )
-                row = cur.fetchone()
-
-        password = row[0] if row else "(not found)"
-
-        print("=" * 60)
-        print(f"  MLflow user ready : {username}")
-        print(f"  Experiment        : {username}")
-        print(f"  Model registry    : {username}_models")
-        print(f"  Username          : {username}")
-        print(f"  Password          : {password}")
-        print(f"  Credentials in    : researcher_credentials table")
-        print(f"  Retrieve via      : GET /api/mlflow/credentials/{username}")
-        print("=" * 60)
-
-    # ── wiring ─────────────────────────────────────────────────────────────────
-    user_info   = create_user()
-    user_info_2 = create_experiment(user_info)
-    user_info_3 = create_model_registry(user_info_2)
-    print_summary(user_info_3)
+    create_mlflow_user()
 
 
 mlflow_user_setup()
