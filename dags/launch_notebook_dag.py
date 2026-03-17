@@ -2,79 +2,119 @@ from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime
 import requests
+import secrets
+import bcrypt
+import psycopg2
 import time
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Internal cluster URL — used for API calls from within the cluster
+# Internal cluster URL — API calls stay inside the cluster
 JUPYTERHUB_HUB_URL = "http://hub.mlops-jupyterhub.svc.cluster.local:8081"
 JUPYTERHUB_API     = f"{JUPYTERHUB_HUB_URL}/hub/api"
 
-# External URL — handed back to the researcher's browser
+# External URL — what the researcher's browser hits
 JUPYTERHUB_PUBLIC_URL = os.environ.get(
     "JUPYTERHUB_PUBLIC_URL",
-    "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80",  # fallback
+    "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80",
+)
+
+# JupyterHub hub PostgreSQL — NativeAuthenticator stores passwords here
+HUB_DB_DSN = (
+    "host=jupyterhub-postgresql-svc.mlops-jupyterhub.svc.cluster.local "
+    "port=5432 "
+    "dbname=jupyterhub "
+    "user=jupyterhub "
+    "password=jupyterhub-password "
+    "sslmode=disable"
 )
 
 
-def get_jupyterhub_token() -> str:
+def get_admin_token() -> str:
     token = os.environ.get("JUPYTERHUB_ADMIN_TOKEN", "").strip()
     if token:
         return token
-    raise RuntimeError(
-        "Could not obtain a JupyterHub token. "
-        "Set JUPYTERHUB_ADMIN_TOKEN env var in your Airflow deployment."
-    )
+    raise RuntimeError("Set JUPYTERHUB_ADMIN_TOKEN env var in airflow/values.yaml.")
+
+
+def _upsert_native_auth_user(username: str, password: str) -> None:
+    """
+    Write a bcrypt-hashed password directly into NativeAuthenticator's
+    users_info table. is_authorized=True so the user can log in immediately
+    without admin approval.
+
+    NativeAuthenticator ORM (nativeauthenticator/orm.py):
+        username         VARCHAR(128)
+        password         BYTEA          ← bcrypt hash
+        is_authorized    BOOLEAN        ← must be True
+        login_email_sent BOOLEAN
+        has_2fa          BOOLEAN
+    """
+    hashed: bytes = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+    with psycopg2.connect(HUB_DB_DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users_info
+                    (username, password, is_authorized, login_email_sent, has_2fa)
+                VALUES (%s, %s, true, false, false)
+                ON CONFLICT (username) DO UPDATE
+                    SET password      = EXCLUDED.password,
+                        is_authorized = true
+                """,
+                (username, hashed),
+            )
+        conn.commit()
+    logger.info(f"✓ NativeAuth password set for '{username}'")
 
 
 def spawn_server(username, **ctx):
     logger.info(f"=== TASK: spawn_server | user={username} ===")
 
-    token   = get_jupyterhub_token()
+    # ── 1. Generate password and write to NativeAuth DB ──────────────────────
+    password = secrets.token_urlsafe(12)
+    _upsert_native_auth_user(username, password)
+
+    # Push password to XCom so poll_until_ready can return it
+    ctx["ti"].xcom_push(key="password", value=password)
+
+    # ── 2. Ensure user exists in JupyterHub's user table ─────────────────────
+    token   = get_admin_token()
     headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
-    # ── Check if user + server already exist ─────────────────────────────────
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
 
     if r.status_code == 200:
         servers = r.json().get("servers", {})
         for name, server_info in servers.items():
             if server_info.get("ready"):
-                logger.info(f"Server '{name}' already running and ready — skipping spawn")
+                logger.info(f"Server '{name}' already running — skipping spawn")
                 return
-        logger.info("User exists but no ready server — proceeding to spawn")
+        logger.info("User exists but no ready server — spawning")
 
     elif r.status_code == 404:
-        logger.info(f"User '{username}' does not exist — creating first...")
+        logger.info(f"User '{username}' not in hub DB — creating...")
         r_create = requests.post(
             f"{JUPYTERHUB_API}/users/{username}",
             headers=headers, json={}, timeout=10,
         )
-        logger.info(f"User creation response: {r_create.status_code}")
         if r_create.status_code not in (200, 201):
             r_create.raise_for_status()
-        logger.info(f"✓ User '{username}' created")
+        logger.info(f"✓ Hub user '{username}' created")
 
     else:
         r.raise_for_status()
 
-    # ── Spawn ─────────────────────────────────────────────────────────────────
-    logger.info(f"Sending spawn request for '{username}'...")
+    # ── 3. Spawn the notebook server ─────────────────────────────────────────
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/server",
         headers=headers, json={}, timeout=10,
     )
     logger.info(f"Spawn response: {r.status_code}")
-
-    if r.status_code == 201:
-        logger.info("Server created immediately (201)")
-    elif r.status_code == 202:
-        logger.info("Spawn accepted, server is starting (202)")
-    elif r.status_code == 400:
-        logger.info(f"Server already exists or is spawning (400) — {r.text}")
-    else:
+    if r.status_code not in (201, 202, 400):
         r.raise_for_status()
 
     logger.info("=== spawn_server DONE ===")
@@ -83,12 +123,12 @@ def spawn_server(username, **ctx):
 def poll_until_ready(username, **ctx):
     logger.info(f"=== TASK: poll_until_ready | user={username} ===")
 
-    admin_token = get_jupyterhub_token()
-    headers     = {"Authorization": f"token {admin_token}", "Content-Type": "application/json"}
+    token   = get_admin_token()
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
-    # ── 1. Wait for server to be ready ───────────────────────────────────────
+    # ── Wait for server to be ready ───────────────────────────────────────────
     for attempt in range(60):
-        logger.info(f"[{attempt + 1}/60] Polling server status for '{username}'...")
+        logger.info(f"[{attempt + 1}/60] Polling '{username}'...")
 
         r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
         r.raise_for_status()
@@ -113,36 +153,25 @@ def poll_until_ready(username, **ctx):
             break
 
         else:
-            logger.info("  No server entry yet — still starting...")
+            logger.info("  Not ready yet...")
             time.sleep(5)
 
     else:
         raise TimeoutError(f"Server for '{username}' did not become ready within 5 minutes.")
 
-    # ── 2. Create a scoped user token ────────────────────────────────────────
-    logger.info(f"Creating user token for '{username}'...")
-    r = requests.post(
-        f"{JUPYTERHUB_API}/users/{username}/tokens",
-        headers=headers,
-        json={
-            "note":       "airflow-launch",
-            "expires_in": 86400,  # 24 h — shorten to e.g. 300 for one-time links
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    user_token = r.json()["token"]
-    logger.info("✓ User token created")
+    # ── Return credentials to caller ─────────────────────────────────────────
+    password = ctx["ti"].xcom_pull(task_ids="spawn_server", key="password")
 
-    # ── 3. Build redirect URL ─────────────────────────────────────────────────
-    # Token goes to the SINGLEUSER server, not /hub/login.
-    # The singleuser server validates it against the Hub via HubOAuth.
-    # This requires `c.HubOAuth.allow_token_in_url = True` in
-    # singleuser.extraConfig in jupyterhub/values.yaml.
-    url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/lab?token={user_token}"
-    logger.info(f"✓ Redirect URL → {url}")
+    logger.info("=" * 60)
+    logger.info(f"  Login URL : {JUPYTERHUB_PUBLIC_URL}")
+    logger.info(f"  Username  : {username}")
+    logger.info(f"  Password  : {password}")
+    logger.info("=" * 60)
 
-    ctx["ti"].xcom_push(key="server_url", value=url)
+    ctx["ti"].xcom_push(key="server_url", value=JUPYTERHUB_PUBLIC_URL)
+    ctx["ti"].xcom_push(key="username",   value=username)
+    ctx["ti"].xcom_push(key="password",   value=password)
+
     logger.info("=== poll_until_ready DONE ===")
 
 
