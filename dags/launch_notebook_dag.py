@@ -1,7 +1,6 @@
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime
-from urllib.parse import quote
 import requests
 import time
 import os
@@ -107,7 +106,7 @@ def poll_until_ready(username, **ctx):
             else:
                 time.sleep(5)
                 continue
-            break  # inner loop found a ready server
+            break
 
         elif isinstance(user_data.get("server"), str) and user_data["server"]:
             logger.info("✓ Server ready (legacy API)")
@@ -136,12 +135,11 @@ def poll_until_ready(username, **ctx):
     logger.info("✓ User token created")
 
     # ── 3. Build redirect URL ─────────────────────────────────────────────────
-    # JupyterHub 5 disabled ?token= on /user/* URLs by default (security fix).
-    # The correct flow is: hit /hub/login?token=...&next=...
-    # The hub validates the token, sets a session cookie, then redirects to /lab.
-    # This requires allow_token_in_url: true in jupyterhub/values.yaml.
-    next_url = quote(f"/user/{username}/lab")
-    url = f"{JUPYTERHUB_PUBLIC_URL}/hub/login?token={user_token}&next={next_url}"
+    # Token goes to the SINGLEUSER server, not /hub/login.
+    # The singleuser server validates it against the Hub via HubOAuth.
+    # This requires `c.HubOAuth.allow_token_in_url = True` in
+    # singleuser.extraConfig in jupyterhub/values.yaml.
+    url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/lab?token={user_token}"
     logger.info(f"✓ Redirect URL → {url}")
 
     ctx["ti"].xcom_push(key="server_url", value=url)
