@@ -1,6 +1,7 @@
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime
+from urllib.parse import quote
 import requests
 import time
 import os
@@ -13,7 +14,6 @@ JUPYTERHUB_HUB_URL = "http://hub.mlops-jupyterhub.svc.cluster.local:8081"
 JUPYTERHUB_API     = f"{JUPYTERHUB_HUB_URL}/hub/api"
 
 # External URL — handed back to the researcher's browser
-# Reads from env var set in airflow/values.yaml so it never needs a code change
 JUPYTERHUB_PUBLIC_URL = os.environ.get(
     "JUPYTERHUB_PUBLIC_URL",
     "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80",  # fallback
@@ -36,6 +36,7 @@ def spawn_server(username, **ctx):
     token   = get_jupyterhub_token()
     headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
+    # ── Check if user + server already exist ─────────────────────────────────
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
 
     if r.status_code == 200:
@@ -60,6 +61,7 @@ def spawn_server(username, **ctx):
     else:
         r.raise_for_status()
 
+    # ── Spawn ─────────────────────────────────────────────────────────────────
     logger.info(f"Sending spawn request for '{username}'...")
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/server",
@@ -105,7 +107,7 @@ def poll_until_ready(username, **ctx):
             else:
                 time.sleep(5)
                 continue
-            break
+            break  # inner loop found a ready server
 
         elif isinstance(user_data.get("server"), str) and user_data["server"]:
             logger.info("✓ Server ready (legacy API)")
@@ -133,8 +135,13 @@ def poll_until_ready(username, **ctx):
     user_token = r.json()["token"]
     logger.info("✓ User token created")
 
-    # ── 3. Build the external redirect URL ───────────────────────────────────
-    url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/lab?token={user_token}"
+    # ── 3. Build redirect URL ─────────────────────────────────────────────────
+    # JupyterHub 5 disabled ?token= on /user/* URLs by default (security fix).
+    # The correct flow is: hit /hub/login?token=...&next=...
+    # The hub validates the token, sets a session cookie, then redirects to /lab.
+    # This requires allow_token_in_url: true in jupyterhub/values.yaml.
+    next_url = quote(f"/user/{username}/lab")
+    url = f"{JUPYTERHUB_PUBLIC_URL}/hub/login?token={user_token}&next={next_url}"
     logger.info(f"✓ Redirect URL → {url}")
 
     ctx["ti"].xcom_push(key="server_url", value=url)
