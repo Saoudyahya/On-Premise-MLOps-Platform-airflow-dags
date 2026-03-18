@@ -4,6 +4,9 @@ from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperato
 from datetime import datetime
 from mlflow import MlflowClient
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000")
 ADMIN_USER = "admin"
@@ -13,6 +16,8 @@ ADMIN_PASS = "mlops-admin-2024"
 def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     import mlflow
 
+    logger.info(f"=== VALIDATE | researcher={researcher_id} model={model_name} v={version} ===")
+
     os.environ["MLFLOW_TRACKING_URI"]      = MLFLOW_URI
     os.environ["MLFLOW_TRACKING_USERNAME"] = ADMIN_USER
     os.environ["MLFLOW_TRACKING_PASSWORD"] = ADMIN_PASS
@@ -20,6 +25,7 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     mlflow.set_tracking_uri(MLFLOW_URI)
     admin_client = MlflowClient(tracking_uri=MLFLOW_URI)
 
+    # ── Get model version ─────────────────────────────────────────────────────
     if version == "latest":
         versions = admin_client.get_latest_versions(model_name)
         if not versions:
@@ -28,19 +34,24 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     else:
         mv = admin_client.get_model_version(model_name, version)
 
+    logger.info(f"Found model version: {mv.version} run_id={mv.run_id}")
+
+    # ── Validate accuracy ─────────────────────────────────────────────────────
     run    = admin_client.get_run(mv.run_id)
     acc    = float(run.data.metrics.get("accuracy", 0))
     thresh = float(threshold)
 
+    logger.info(f"accuracy={acc}, threshold={thresh}")
+
     if acc < thresh:
         raise ValueError(f"accuracy {acc} is below threshold {thresh}")
 
+    # ── Promote to production ─────────────────────────────────────────────────
     admin_client.set_registered_model_alias(model_name, "production", mv.version)
+    logger.info(f"✓ Alias 'production' → {model_name} v{mv.version}")
 
     ctx["ti"].xcom_push(key="model_version", value=mv.version)
-    ctx["ti"].xcom_push(key="safe_name",
-        value=f"{researcher_id}-{model_name}".replace("_", "-").lower()
-    )
+    logger.info("=== VALIDATE DONE ===")
 
 
 with DAG(
@@ -68,11 +79,9 @@ with DAG(
         },
     )
 
-    # ── KubernetesPodOperator spins up the serving container directly ─────────
     t2 = KubernetesPodOperator(
         task_id="deploy_serving_pod",
-        name="serve-{{ dag_run.conf['researcher_id'] }}-{{ dag_run.conf['model_name'] }}"
-             .replace("_", "-").lower(),
+        name="mlflow-serving-pod",
         namespace="mlops-serving",
         image="ghcr.io/mlflow/mlflow:v3.10.1",
         cmds=["sh", "-c"],
@@ -90,7 +99,7 @@ with DAG(
             "AWS_ACCESS_KEY_ID":        "minio-admin",
             "AWS_SECRET_ACCESS_KEY":    "minio-admin",
         },
-        is_delete_operator_pod=False,   # ← keep pod running after task completes
+        is_delete_operator_pod=False,   # ← keep pod alive after task finishes
         get_logs=True,
         do_xcom_push=False,
     )
