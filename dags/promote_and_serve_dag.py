@@ -1,9 +1,9 @@
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from datetime import datetime
 from mlflow import MlflowClient
 import os
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,6 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     thresh = float(threshold)
 
     logger.info(f"accuracy={acc}, threshold={thresh}")
-
     if acc < thresh:
         raise ValueError(f"accuracy {acc} is below threshold {thresh}")
 
@@ -52,6 +51,116 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
 
     ctx["ti"].xcom_push(key="model_version", value=mv.version)
     logger.info("=== VALIDATE DONE ===")
+
+
+def launch_and_wait_healthy(model_name, **ctx):
+    from kubernetes import client as k8s, config as k8s_config
+
+    logger.info(f"=== DEPLOY SERVING POD | model={model_name} ===")
+
+    k8s_config.load_incluster_config()
+    core_v1   = k8s.CoreV1Api()
+    namespace = "mlops-serving"
+    pod_name  = f"serve-{model_name.replace('_', '-').lower()}"
+    svc_name  = f"{pod_name}-svc"
+
+    # ── Delete old pod if exists ──────────────────────────────────────────────
+    try:
+        core_v1.delete_namespaced_pod(pod_name, namespace)
+        logger.info(f"Deleted old pod {pod_name}, waiting 3s...")
+        time.sleep(3)
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    # ── Create pod ────────────────────────────────────────────────────────────
+    pod = k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(
+            name=pod_name,
+            namespace=namespace,
+            labels={"app": pod_name, "model": model_name},
+        ),
+        spec=k8s.V1PodSpec(
+            restart_policy="Always",
+            containers=[
+                k8s.V1Container(
+                    name="mlflow-serve",
+                    image="ghcr.io/mlflow/mlflow:v3.10.1",
+                    command=["sh", "-c"],
+                    args=[
+                        f"pip install mlflow boto3 scikit-learn --quiet && "
+                        f"mlflow models serve "
+                        f"--model-uri 'models:/{model_name}@production' "
+                        f"--host 0.0.0.0 --port 8001 --no-conda"
+                    ],
+                    ports=[k8s.V1ContainerPort(container_port=8001)],
+                    env=[
+                        k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
+                        k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME", value=ADMIN_USER),
+                        k8s.V1EnvVar(name="MLFLOW_TRACKING_PASSWORD", value=ADMIN_PASS),
+                        k8s.V1EnvVar(name="AWS_ENDPOINT_URL",         value="http://minio-svc.mlops-minio.svc.cluster.local:9000"),
+                        k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="minio-admin"),
+                        k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="minio-admin"),
+                    ],
+                    readiness_probe=k8s.V1Probe(
+                        http_get=k8s.V1HTTPGetAction(path="/health", port=8001),
+                        initial_delay_seconds=15,
+                        period_seconds=5,
+                        failure_threshold=10,
+                    ),
+                    resources=k8s.V1ResourceRequirements(
+                        requests={"memory": "512Mi", "cpu": "250m"},
+                        limits={"memory": "1Gi",   "cpu": "500m"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    core_v1.create_namespaced_pod(namespace, pod)
+    logger.info(f"✓ Pod {pod_name} created")
+
+    # ── Create / update Service ───────────────────────────────────────────────
+    service = k8s.V1Service(
+        metadata=k8s.V1ObjectMeta(name=svc_name, namespace=namespace),
+        spec=k8s.V1ServiceSpec(
+            selector={"app": pod_name},
+            ports=[k8s.V1ServicePort(port=8001, target_port=8001)],
+        ),
+    )
+    try:
+        core_v1.read_namespaced_service(svc_name, namespace)
+        core_v1.replace_namespaced_service(svc_name, namespace, service)
+        logger.info(f"✓ Service {svc_name} updated")
+    except k8s.exceptions.ApiException as e:
+        if e.status == 404:
+            core_v1.create_namespaced_service(namespace, service)
+            logger.info(f"✓ Service {svc_name} created")
+        else:
+            raise
+
+    # ── Poll until Running + Ready ────────────────────────────────────────────
+    logger.info("Waiting for pod to become Ready (max 5 min)...")
+    for attempt in range(60):
+        time.sleep(5)
+        pod_status = core_v1.read_namespaced_pod(pod_name, namespace)
+        phase      = pod_status.status.phase
+
+        if phase == "Running":
+            conditions = pod_status.status.conditions or []
+            ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
+            if ready:
+                logger.info(f"✅ Pod {pod_name} is Running and Ready!")
+                logger.info(f"   Internal : http://{svc_name}.{namespace}.svc.cluster.local:8001/invocations")
+                logger.info(f"   Port-fwd : kubectl port-forward svc/{svc_name} 8001:8001 -n {namespace}")
+                return   # ← DAG task exits, pod keeps running
+
+        elif phase in ("Failed", "Unknown"):
+            raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
+
+        logger.info(f"[{attempt+1}/60] phase={phase} — waiting...")
+
+    raise TimeoutError(f"Pod {pod_name} did not become Ready within 5 minutes")
 
 
 with DAG(
@@ -79,29 +188,12 @@ with DAG(
         },
     )
 
-    t2 = KubernetesPodOperator(
-    task_id="deploy_serving_pod",
-    name="mlflow-serving-pod",
-    namespace="mlops-serving",
-    image="ghcr.io/mlflow/mlflow:v3.10.1",
-    cmds=["sh", "-c"],
-    arguments=[
-        "pip install mlflow boto3 scikit-learn --quiet && "
-        "mlflow models serve "
-        "--model-uri 'models:/{{ dag_run.conf[\"model_name\"] }}@production' "
-        "--host 0.0.0.0 --port 8001 --no-conda"
-    ],
-    env_vars={
-        "MLFLOW_TRACKING_URI":      MLFLOW_URI,
-        "MLFLOW_TRACKING_USERNAME": ADMIN_USER,
-        "MLFLOW_TRACKING_PASSWORD": ADMIN_PASS,
-        "AWS_ENDPOINT_URL":         "http://minio-svc.mlops-minio.svc.cluster.local:9000",
-        "AWS_ACCESS_KEY_ID":        "minio-admin",
-        "AWS_SECRET_ACCESS_KEY":    "minio-admin",
-    },
-    is_delete_operator_pod=False,
-    get_logs=True,
-    do_xcom_push=False,
-        )
+    t2 = PythonOperator(
+        task_id="deploy_serving_pod",
+        python_callable=launch_and_wait_healthy,
+        op_kwargs={
+            "model_name": model_name,
+        },
+    )
 
     t1 >> t2
