@@ -80,28 +80,28 @@ with DAG(
     )
 
     t2 = KubernetesPodOperator(
-        task_id="deploy_serving_pod",
-        name="mlflow-serving-pod",
-        namespace="mlops-serving",
-        image="ghcr.io/mlflow/mlflow:v3.10.1",
-        cmds=["sh", "-c"],
-        arguments=[
-            "pip install mlflow boto3 scikit-learn --quiet && "
-            "mlflow models serve "
-            "--model-uri 'models://{{ dag_run.conf[\"model_name\"] }}@production' "
-            "--host 0.0.0.0 --port 8001 --no-conda"
-        ],
-        env_vars={
-            "MLFLOW_TRACKING_URI":      MLFLOW_URI,
-            "MLFLOW_TRACKING_USERNAME": ADMIN_USER,
-            "MLFLOW_TRACKING_PASSWORD": ADMIN_PASS,
-            "AWS_ENDPOINT_URL":         "http://minio-svc.mlops-minio.svc.cluster.local:9000",
-            "AWS_ACCESS_KEY_ID":        "minio-admin",
-            "AWS_SECRET_ACCESS_KEY":    "minio-admin",
-        },
-        is_delete_operator_pod=False,   # ← keep pod alive after task finishes
-        get_logs=True,
-        do_xcom_push=False,
-    )
+    task_id="deploy_serving_pod",
+    name="mlflow-serving-pod",
+    namespace="mlops-serving",
+    image="ghcr.io/mlflow/mlflow:v3.10.1",
+    cmds=["sh", "-c"],
+    arguments=[
+        "pip install mlflow boto3 scikit-learn --quiet && "
+        "mlflow models serve "
+        "--model-uri 'models:/{{ dag_run.conf[\"model_name\"] }}@production' "
+        "--host 0.0.0.0 --port 8001 --no-conda"
+    ],
+    env_vars={
+        "MLFLOW_TRACKING_URI":      MLFLOW_URI,
+        "MLFLOW_TRACKING_USERNAME": ADMIN_USER,
+        "MLFLOW_TRACKING_PASSWORD": ADMIN_PASS,
+        "AWS_ENDPOINT_URL":         "http://minio-svc.mlops-minio.svc.cluster.local:9000",
+        "AWS_ACCESS_KEY_ID":        "minio-admin",
+        "AWS_SECRET_ACCESS_KEY":    "minio-admin",
+    },
+    is_delete_operator_pod=False,
+    get_logs=True,
+    do_xcom_push=False,
+        )
 
     t1 >> t2
