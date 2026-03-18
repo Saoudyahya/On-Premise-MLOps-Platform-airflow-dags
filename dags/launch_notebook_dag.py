@@ -21,7 +21,7 @@ JUPYTERHUB_PUBLIC_URL = os.environ.get(
     "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80",
 )
 
-# JupyterHub hub PostgreSQL — NativeAuthenticator stores passwords here
+# JupyterHub PostgreSQL DSN — NativeAuthenticator + credentials live here
 HUB_DB_DSN = (
     "host=jupyterhub-postgresql-svc.mlops-jupyterhub.svc.cluster.local "
     "port=5432 "
@@ -44,13 +44,6 @@ def _upsert_native_auth_user(username: str, password: str) -> None:
     Write a bcrypt-hashed password directly into NativeAuthenticator's
     users_info table. is_authorized=True so the user can log in immediately
     without admin approval.
-
-    NativeAuthenticator ORM (nativeauthenticator/orm.py):
-        username         VARCHAR(128)
-        password         BYTEA          ← bcrypt hash
-        is_authorized    BOOLEAN        ← must be True
-        login_email_sent BOOLEAN
-        has_2fa          BOOLEAN
     """
     hashed: bytes = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
 
@@ -71,14 +64,41 @@ def _upsert_native_auth_user(username: str, password: str) -> None:
     logger.info(f"✓ NativeAuth password set for '{username}'")
 
 
+def _upsert_researcher_credentials(username: str, password: str) -> None:
+    """
+    Persist the plaintext JupyterHub credentials in researcher_credentials
+    so they can be retrieved later (e.g. by an API or another DAG).
+
+    ON CONFLICT rotates the password — re-running the DAG always produces
+    fresh credentials rather than silently failing.
+    """
+    with psycopg2.connect(HUB_DB_DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO researcher_credentials
+                    (researcher_id, jupyter_username, jupyter_password)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (researcher_id) DO UPDATE
+                    SET jupyter_password = EXCLUDED.jupyter_password,
+                        updated_at       = NOW()
+                """,
+                (username, username, password),
+            )
+        conn.commit()
+    logger.info(f"✓ Credentials stored in researcher_credentials for '{username}'")
+
+
 def spawn_server(username, **ctx):
     logger.info(f"=== TASK: spawn_server | user={username} ===")
 
-    # ── 1. Generate password and write to NativeAuth DB ──────────────────────
+    # ── 1. Generate password, write to NativeAuth DB, persist plaintext ──────
     password = secrets.token_urlsafe(12)
-    _upsert_native_auth_user(username, password)
 
-    # Push password to XCom so poll_until_ready can return it
+    _upsert_native_auth_user(username, password)
+    _upsert_researcher_credentials(username, password)
+
+    # Push password to XCom so poll_until_ready can surface it in logs
     ctx["ti"].xcom_push(key="password", value=password)
 
     # ── 2. Ensure user exists in JupyterHub's user table ─────────────────────
@@ -166,6 +186,7 @@ def poll_until_ready(username, **ctx):
     logger.info(f"  Login URL : {JUPYTERHUB_PUBLIC_URL}")
     logger.info(f"  Username  : {username}")
     logger.info(f"  Password  : {password}")
+    logger.info("  Credentials persisted in researcher_credentials (JupyterHub PostgreSQL)")
     logger.info("=" * 60)
 
     ctx["ti"].xcom_push(key="server_url", value=JUPYTERHUB_PUBLIC_URL)
