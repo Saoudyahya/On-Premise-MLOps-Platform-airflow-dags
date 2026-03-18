@@ -2,8 +2,6 @@ from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from datetime import datetime
 import requests
-import secrets
-import bcrypt
 import psycopg2
 import time
 import os
@@ -11,8 +9,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-JUPYTERHUB_HUB_URL = "http://hub.mlops-jupyterhub.svc.cluster.local:8081"
-JUPYTERHUB_API     = f"{JUPYTERHUB_HUB_URL}/hub/api"
+JUPYTERHUB_API = "http://hub.mlops-jupyterhub.svc.cluster.local:8081/hub/api"
 
 JUPYTERHUB_PUBLIC_URL = os.environ.get(
     "JUPYTERHUB_PUBLIC_URL",
@@ -31,173 +28,163 @@ HUB_DB_DSN = (
 
 def get_admin_token() -> str:
     token = os.environ.get("JUPYTERHUB_ADMIN_TOKEN", "").strip()
-    if token:
-        return token
-    raise RuntimeError("Set JUPYTERHUB_ADMIN_TOKEN env var in airflow/values.yaml.")
+    if not token:
+        raise RuntimeError("Set JUPYTERHUB_ADMIN_TOKEN env var in airflow/values.yaml.")
+    return token
 
 
-def _upsert_native_auth_user(username: str, password: str) -> None:
+def _get_username(researcher_id: str) -> str:
     """
-    Write a bcrypt-hashed password into NativeAuthenticator's users_info table.
-    Uses explicit SELECT → UPDATE/INSERT instead of ON CONFLICT because
-    users_info has no UNIQUE constraint on username.
+    Look up the JupyterHub username for a researcher.
+    Raises RuntimeError if jupyter_user_setup_dag hasn't been run yet.
     """
-    hashed: bytes = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM users_info WHERE username = %s",
-                (username,),
+                "SELECT jupyter_username FROM researcher_credentials WHERE researcher_id = %s",
+                (researcher_id,),
             )
-            exists = cur.fetchone() is not None
+            row = cur.fetchone()
 
-            if exists:
-                cur.execute(
-                    """
-                    UPDATE users_info
-                       SET password      = %s,
-                           is_authorized = true
-                     WHERE username = %s
-                    """,
-                    (hashed, username),
-                )
-                logger.info(f"✓ NativeAuth password updated for '{username}'")
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO users_info
-                        (username, password, is_authorized, login_email_sent, has_2fa)
-                    VALUES (%s, %s, true, false, false)
-                    """,
-                    (username, hashed),
-                )
-                logger.info(f"✓ NativeAuth user created for '{username}'")
-        conn.commit()
+    if row is None:
+        raise RuntimeError(
+            f"No JupyterHub credentials found for researcher '{researcher_id}'. "
+            "Run POST /api/notebook/setup (jupyter_user_setup_dag) first."
+        )
+    return row[0]
 
 
-def _upsert_researcher_credentials(username: str, password: str) -> None:
+def _upsert_notebook_record(
+    researcher_id: str,
+    notebook_name: str,
+    username: str,
+    status: str,
+    notebook_url: str = "",
+    dag_run_id: str = "",
+) -> None:
     """
-    Persist the plaintext JupyterHub credentials in researcher_credentials.
-    This table was created by hub-credentials-table-job.yaml and does have
-    a UNIQUE constraint on researcher_id, so ON CONFLICT is safe here.
+    Insert or update a row in researcher_notebooks so Django can list
+    notebooks without calling the JupyterHub API.
     """
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO researcher_credentials
-                    (researcher_id, jupyter_username, jupyter_password)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (researcher_id) DO UPDATE
-                    SET jupyter_password = EXCLUDED.jupyter_password,
+                INSERT INTO researcher_notebooks
+                    (researcher_id, notebook_name, jupyter_username,
+                     notebook_url, status, dag_run_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (researcher_id, notebook_name) DO UPDATE
+                    SET status           = EXCLUDED.status,
+                        notebook_url     = EXCLUDED.notebook_url,
+                        dag_run_id       = EXCLUDED.dag_run_id,
                         updated_at       = NOW()
                 """,
-                (username, username, password),
+                (researcher_id, notebook_name, username, notebook_url, status, dag_run_id),
             )
         conn.commit()
-    logger.info(f"✓ Credentials stored in researcher_credentials for '{username}'")
+    logger.info(f"researcher_notebooks updated: {researcher_id}/{notebook_name} → {status}")
 
 
-def spawn_server(username, **ctx):
-    logger.info(f"=== TASK: spawn_server | user={username} ===")
+def spawn_named_server(researcher_id, notebook_name, **ctx):
+    """
+    Start a JupyterHub named server for this researcher.
+    The user must already exist (jupyter_user_setup_dag must have run).
+    """
+    logger.info(f"=== spawn_named_server | researcher={researcher_id} notebook={notebook_name} ===")
 
-    password = secrets.token_urlsafe(12)
+    username    = _get_username(researcher_id)
+    token       = get_admin_token()
+    headers     = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+    dag_run_id  = ctx["dag_run"].run_id
 
-    _upsert_native_auth_user(username, password)
-    _upsert_researcher_credentials(username, password)
+    # Record that we're starting this notebook
+    _upsert_notebook_record(
+        researcher_id=researcher_id,
+        notebook_name=notebook_name,
+        username=username,
+        status="starting",
+        dag_run_id=dag_run_id,
+    )
 
-    ctx["ti"].xcom_push(key="password", value=password)
-
-    token   = get_admin_token()
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-
+    # Check if this named server already exists and is ready
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
+    r.raise_for_status()
 
-    if r.status_code == 200:
-        servers = r.json().get("servers", {})
-        for name, server_info in servers.items():
-            if server_info.get("ready"):
-                logger.info(f"Server '{name}' already running — skipping spawn")
-                return
-        logger.info("User exists but no ready server — spawning")
+    servers = r.json().get("servers", {})
+    if notebook_name in servers and servers[notebook_name].get("ready"):
+        logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
+        return
 
-    elif r.status_code == 404:
-        logger.info(f"User '{username}' not in hub DB — creating...")
-        r_create = requests.post(
-            f"{JUPYTERHUB_API}/users/{username}",
-            headers=headers, json={}, timeout=10,
-        )
-        if r_create.status_code not in (200, 201):
-            r_create.raise_for_status()
-        logger.info(f"✓ Hub user '{username}' created")
-
-    else:
-        r.raise_for_status()
-
+    # Start the named server
     r = requests.post(
-        f"{JUPYTERHUB_API}/users/{username}/server",
-        headers=headers, json={}, timeout=10,
+        f"{JUPYTERHUB_API}/users/{username}/servers/{notebook_name}",
+        headers=headers,
+        json={},
+        timeout=10,
     )
     logger.info(f"Spawn response: {r.status_code}")
+
+    # 201 = created, 202 = pending, 400 = already running
     if r.status_code not in (201, 202, 400):
         r.raise_for_status()
 
-    logger.info("=== spawn_server DONE ===")
+    logger.info("=== spawn_named_server DONE ===")
 
 
-def poll_until_ready(username, **ctx):
-    logger.info(f"=== TASK: poll_until_ready | user={username} ===")
+def poll_until_ready(researcher_id, notebook_name, **ctx):
+    """
+    Poll the Hub API until the named server is ready, then update the
+    researcher_notebooks table so Django can return the URL immediately.
+    """
+    logger.info(f"=== poll_until_ready | researcher={researcher_id} notebook={notebook_name} ===")
 
-    token   = get_admin_token()
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+    username = _get_username(researcher_id)
+    token    = get_admin_token()
+    headers  = {"Authorization": f"token {token}", "Content-Type": "application/json"}
 
     for attempt in range(60):
-        logger.info(f"[{attempt + 1}/60] Polling '{username}'...")
+        logger.info(f"[{attempt + 1}/60] Polling named server '{notebook_name}'...")
 
         r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
         r.raise_for_status()
-        user_data = r.json()
 
-        servers = user_data.get("servers", {})
-        if servers:
-            for name, server_info in servers.items():
-                ready   = server_info.get("ready", False)
-                pending = server_info.get("pending")
-                logger.info(f"  Server '{name}': ready={ready}, pending={pending}")
-                if ready:
-                    logger.info(f"✓ Server '{name}' is ready")
-                    break
-            else:
-                time.sleep(5)
-                continue
-            break
+        server = r.json().get("servers", {}).get(notebook_name)
 
-        elif isinstance(user_data.get("server"), str) and user_data["server"]:
-            logger.info("✓ Server ready (legacy API)")
-            break
-
-        else:
-            logger.info("  Not ready yet...")
+        if server is None:
+            logger.info("  Server not found yet — waiting...")
             time.sleep(5)
+            continue
 
-    else:
-        raise TimeoutError(f"Server for '{username}' did not become ready within 5 minutes.")
+        ready   = server.get("ready", False)
+        pending = server.get("pending")
+        logger.info(f"  ready={ready}, pending={pending}")
 
-    password = ctx["ti"].xcom_pull(task_ids="spawn_server", key="password")
+        if ready:
+            notebook_url = f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/{notebook_name}/lab"
 
-    logger.info("=" * 60)
-    logger.info(f"  Login URL : {JUPYTERHUB_PUBLIC_URL}")
-    logger.info(f"  Username  : {username}")
-    logger.info(f"  Password  : {password}")
-    logger.info(f"  Stored in : researcher_credentials (JupyterHub PostgreSQL)")
-    logger.info("=" * 60)
+            _upsert_notebook_record(
+                researcher_id=researcher_id,
+                notebook_name=notebook_name,
+                username=username,
+                status="running",
+                notebook_url=notebook_url,
+                dag_run_id=ctx["dag_run"].run_id,
+            )
 
-    ctx["ti"].xcom_push(key="server_url", value=JUPYTERHUB_PUBLIC_URL)
-    ctx["ti"].xcom_push(key="username",   value=username)
-    ctx["ti"].xcom_push(key="password",   value=password)
+            logger.info("=" * 60)
+            logger.info(f"  researcher_id : {researcher_id}")
+            logger.info(f"  notebook_name : {notebook_name}")
+            logger.info(f"  notebook_url  : {notebook_url}")
+            logger.info("=" * 60)
+            logger.info("=== poll_until_ready DONE ===")
+            return
 
-    logger.info("=== poll_until_ready DONE ===")
+        time.sleep(5)
+
+    raise TimeoutError(
+        f"Named server '{notebook_name}' for '{username}' did not become ready within 5 minutes."
+    )
 
 
 with DAG(
@@ -210,9 +197,25 @@ with DAG(
     tags=["notebook"],
 ) as dag:
 
-    username = "{{ dag_run.conf['username'] }}"
+    researcher_id = "{{ dag_run.conf['researcher_id'] }}"
+    notebook_name = "{{ dag_run.conf['notebook_name'] }}"
 
-    t1 = PythonOperator(task_id="spawn_server",     python_callable=spawn_server,     op_kwargs={"username": username})
-    t2 = PythonOperator(task_id="poll_until_ready", python_callable=poll_until_ready, op_kwargs={"username": username})
+    t1 = PythonOperator(
+        task_id="spawn_named_server",
+        python_callable=spawn_named_server,
+        op_kwargs={
+            "researcher_id": researcher_id,
+            "notebook_name": notebook_name,
+        },
+    )
+
+    t2 = PythonOperator(
+        task_id="poll_until_ready",
+        python_callable=poll_until_ready,
+        op_kwargs={
+            "researcher_id": researcher_id,
+            "notebook_name": notebook_name,
+        },
+    )
 
     t1 >> t2
