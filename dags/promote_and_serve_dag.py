@@ -18,16 +18,24 @@ ADMIN_PASS = "mlops-admin-2024"
 def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     logger.info(f"=== VALIDATE | researcher={researcher_id} model={model_name} v={version} ===")
 
-    os.environ["MLFLOW_TRACKING_USERNAME"] = researcher_id
-    os.environ["MLFLOW_TRACKING_PASSWORD"] = ctx["dag_run"].conf.get("mlflow_password", "")
+    # ✅ Set admin creds via env vars — works in all MLflow versions
+    os.environ["MLFLOW_TRACKING_URI"]      = MLFLOW_URI
+    os.environ["MLFLOW_TRACKING_USERNAME"] = ADMIN_USER
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = ADMIN_PASS
 
-    # Use admin client to read metrics (researcher can't read other runs)
+    import mlflow
+    mlflow.set_tracking_uri(MLFLOW_URI)
+
     admin_client = MlflowClient(tracking_uri=MLFLOW_URI)
-    admin_client._tracking_client.client._auth = (ADMIN_USER, ADMIN_PASS)
 
     # Get the model version
-    mv = admin_client.get_model_version(model_name, version) if version != "latest" \
-         else admin_client.get_latest_versions(model_name)[0]
+    if version == "latest":
+        versions = admin_client.get_latest_versions(model_name)
+        if not versions:
+            raise ValueError(f"No versions found for model '{model_name}'")
+        mv = versions[0]
+    else:
+        mv = admin_client.get_model_version(model_name, version)
 
     run    = admin_client.get_run(mv.run_id)
     acc    = float(run.data.metrics.get("accuracy", 0))
@@ -37,7 +45,6 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     if acc < thresh:
         raise ValueError(f"accuracy {acc} is below threshold {thresh}")
 
-    # Set alias: staging first
     admin_client.set_registered_model_alias(model_name, "staging", mv.version)
     logger.info(f"✓ Alias 'staging' → {model_name} v{mv.version}")
 
@@ -149,6 +156,8 @@ spec:
         raise RuntimeError(f"kubectl apply failed:\n{result.stderr}")
 
     # Promote alias to production
+    os.environ["MLFLOW_TRACKING_USERNAME"] = ADMIN_USER
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = ADMIN_PASS
     admin_client = MlflowClient(tracking_uri=MLFLOW_URI)
     admin_client.set_registered_model_alias(model_name, "production", version)
     logger.info(f"✓ Alias 'production' → {model_name} v{version}")
