@@ -34,10 +34,6 @@ def get_admin_token() -> str:
 
 
 def _get_username(researcher_id: str) -> str:
-    """
-    Look up the JupyterHub username for a researcher.
-    Raises RuntimeError if jupyter_user_setup_dag hasn't been run yet.
-    """
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -62,10 +58,6 @@ def _upsert_notebook_record(
     notebook_url: str = "",
     dag_run_id: str = "",
 ) -> None:
-    """
-    Insert or update a row in researcher_notebooks so Django can list
-    notebooks without calling the JupyterHub API.
-    """
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -89,7 +81,13 @@ def _upsert_notebook_record(
 def spawn_named_server(researcher_id, notebook_name, **ctx):
     """
     Start a JupyterHub named server for this researcher.
-    The user must already exist (jupyter_user_setup_dag must have run).
+
+    Each unique notebook_name creates its own independent pod — a researcher
+    can have multiple notebooks running at the same time (up to
+    named_server_limit_per_user in jupyterhub/values.yaml, currently 5).
+
+    Only the exact (username, notebook_name) pair is checked; all other
+    named servers for this researcher are untouched.
     """
     logger.info(f"=== spawn_named_server | researcher={researcher_id} notebook={notebook_name} ===")
 
@@ -98,7 +96,6 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
     headers     = {"Authorization": f"token {token}", "Content-Type": "application/json"}
     dag_run_id  = ctx["dag_run"].run_id
 
-    # Record that we're starting this notebook
     _upsert_notebook_record(
         researcher_id=researcher_id,
         notebook_name=notebook_name,
@@ -107,28 +104,40 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
         dag_run_id=dag_run_id,
     )
 
-    # Check if this named server already exists and is ready
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
 
     if r.status_code == 404:
         raise RuntimeError(
-            f"User '{username}' not found in JupyterHub Hub. "
+            f"User '{username}' not found in JupyterHub. "
             "Run POST /api/notebook/setup first to create the user."
         )
     r.raise_for_status()
 
     servers = r.json().get("servers", {})
-    if notebook_name in servers:
-        if servers[notebook_name].get("ready"):
-            logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
-            return
-        else:
-            pending = servers[notebook_name].get("pending")
-            logger.info(f"Named server '{notebook_name}' already exists, pending={pending} — waiting for poll task")
-            return
 
-    # Start the named server
-    logger.info(f"Spawning named server: POST /hub/api/users/{username}/servers/{notebook_name}")
+    # ── Guard: this specific named server is already alive — do nothing ───────
+    # Only this (username, notebook_name) pair is inspected.
+    # All other named servers for this researcher continue running undisturbed.
+    if notebook_name in servers:
+        server_state = servers[notebook_name]
+        if server_state.get("ready"):
+            logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
+            # Keep the DB record fresh
+            _upsert_notebook_record(
+                researcher_id=researcher_id,
+                notebook_name=notebook_name,
+                username=username,
+                status="running",
+                notebook_url=f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/{notebook_name}/lab",
+                dag_run_id=dag_run_id,
+            )
+            return
+        pending = server_state.get("pending")
+        logger.info(f"Named server '{notebook_name}' already pending={pending} — letting poll task wait")
+        return
+
+    # ── Spawn the new named server ────────────────────────────────────────────
+    logger.info(f"Spawning: POST /hub/api/users/{username}/servers/{notebook_name}")
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/servers/{notebook_name}",
         headers=headers,
@@ -138,11 +147,12 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
 
     logger.info(f"Spawn response: {r.status_code} — {r.text}")
 
-    if r.status_code in (201, 202):
-        logger.info(f"Named server '{notebook_name}' spawn accepted")
+    # 201 = created, 202 = accepted/pending, 200 = already exists (race condition)
+    if r.status_code in (200, 201, 202):
+        logger.info(f"Named server '{notebook_name}' spawn accepted (HTTP {r.status_code})")
     else:
         raise RuntimeError(
-            f"JupyterHub rejected named server spawn for '{username}/{notebook_name}': "
+            f"JupyterHub rejected spawn for '{username}/{notebook_name}': "
             f"HTTP {r.status_code} — {r.text}"
         )
 
@@ -189,7 +199,6 @@ def poll_until_ready(researcher_id, notebook_name, **ctx):
                 dag_run_id=ctx["dag_run"].run_id,
             )
 
-            # Push to XCom so Django can read the URL without a DB connection
             ctx["ti"].xcom_push(key="notebook_url",  value=notebook_url)
             ctx["ti"].xcom_push(key="notebook_name", value=notebook_name)
 
