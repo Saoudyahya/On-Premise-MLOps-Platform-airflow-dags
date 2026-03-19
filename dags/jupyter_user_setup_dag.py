@@ -124,11 +124,15 @@ def setup_user(researcher_id, **ctx):
     else:
         r.raise_for_status()
 
+    # Push credentials to XCom so Django can read them via Airflow API
+    # without needing a direct DB connection
+    ctx["ti"].xcom_push(key="jupyter_username", value=username)
+    ctx["ti"].xcom_push(key="jupyter_password", value=password)
+
     logger.info("=" * 60)
     logger.info(f"  researcher_id : {researcher_id}")
     logger.info(f"  username      : {username}")
     logger.info(f"  password      : {password}")
-    logger.info(f"  Fetch via     : GET /api/notebook/credentials/{researcher_id}")
     logger.info("=" * 60)
     logger.info("=== jupyter_user_setup DONE ===")
 
