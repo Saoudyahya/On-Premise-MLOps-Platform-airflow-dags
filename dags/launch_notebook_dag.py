@@ -109,25 +109,42 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
 
     # Check if this named server already exists and is ready
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
+
+    if r.status_code == 404:
+        raise RuntimeError(
+            f"User '{username}' not found in JupyterHub Hub. "
+            "Run POST /api/notebook/setup first to create the user."
+        )
     r.raise_for_status()
 
     servers = r.json().get("servers", {})
-    if notebook_name in servers and servers[notebook_name].get("ready"):
-        logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
-        return
+    if notebook_name in servers:
+        if servers[notebook_name].get("ready"):
+            logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
+            return
+        else:
+            pending = servers[notebook_name].get("pending")
+            logger.info(f"Named server '{notebook_name}' already exists, pending={pending} — waiting for poll task")
+            return
 
     # Start the named server
+    logger.info(f"Spawning named server: POST /hub/api/users/{username}/servers/{notebook_name}")
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/servers/{notebook_name}",
         headers=headers,
         json={},
-        timeout=10,
+        timeout=30,
     )
-    logger.info(f"Spawn response: {r.status_code}")
 
-    # 201 = created, 202 = pending, 400 = already running
-    if r.status_code not in (201, 202, 400):
-        r.raise_for_status()
+    logger.info(f"Spawn response: {r.status_code} — {r.text}")
+
+    if r.status_code in (201, 202):
+        logger.info(f"Named server '{notebook_name}' spawn accepted")
+    else:
+        raise RuntimeError(
+            f"JupyterHub rejected named server spawn for '{username}/{notebook_name}': "
+            f"HTTP {r.status_code} — {r.text}"
+        )
 
     logger.info("=== spawn_named_server DONE ===")
 
@@ -171,6 +188,10 @@ def poll_until_ready(researcher_id, notebook_name, **ctx):
                 notebook_url=notebook_url,
                 dag_run_id=ctx["dag_run"].run_id,
             )
+
+            # Push to XCom so Django can read the URL without a DB connection
+            ctx["ti"].xcom_push(key="notebook_url",  value=notebook_url)
+            ctx["ti"].xcom_push(key="notebook_name", value=notebook_name)
 
             logger.info("=" * 60)
             logger.info(f"  researcher_id : {researcher_id}")
