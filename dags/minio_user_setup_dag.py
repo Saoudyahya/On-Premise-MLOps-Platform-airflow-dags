@@ -92,6 +92,79 @@ def _save_credentials(researcher_id: str, access_key: str, secret_key: str) -> N
 
 
 def setup_minio_user(researcher_id, **ctx):
+    from minio.minioadmin import MinioAdmin
+    from minio.credentials import StaticProvider
+    import tempfile
+    import os
+
+    logger.info(f"=== minio_user_setup | researcher={researcher_id} ===")
+
+    access_key  = researcher_id
+    policy_name = f"researcher-{researcher_id}"
+
+    admin = MinioAdmin(
+        endpoint=MINIO_ENDPOINT,
+        credentials=StaticProvider(MINIO_ADMIN_KEY, MINIO_ADMIN_SEC),
+        secure=False,
+    )
+
+    # ── 1. Create or verify user ──────────────────────────────────────────────
+    user_exists = False
+    try:
+        admin.user_info(access_key)
+        user_exists = True
+        logger.info(f"MinIO user '{access_key}' already exists")
+    except Exception:
+        logger.info(f"MinIO user '{access_key}' not found — creating")
+
+    if user_exists:
+        stored = _get_stored_secret(researcher_id)
+        if stored:
+            secret_key = stored
+            logger.info("Returning stored credentials (no rotation needed)")
+        else:
+            secret_key = secrets.token_urlsafe(32)
+            admin.user_add(access_key, secret_key)
+            logger.info("Password rotated (no prior DB record found)")
+            _save_credentials(researcher_id, access_key, secret_key)
+    else:
+        secret_key = secrets.token_urlsafe(32)
+        admin.user_add(access_key, secret_key)
+        logger.info(f"✅ MinIO user '{access_key}' created")
+        _save_credentials(researcher_id, access_key, secret_key)
+
+    # ── 2. Create / update scoped IAM policy ─────────────────────────────────
+    # policy_add expects a FILE PATH (str), not a BytesIO or raw string
+    policy_json = _researcher_policy(researcher_id)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as tmp:
+        tmp.write(policy_json)
+        tmp_path = tmp.name
+
+    try:
+        admin.policy_add(policy_name, tmp_path)   # ← pass the file path
+        logger.info(f"✅ Policy '{policy_name}' created/updated")
+    except Exception as exc:
+        logger.warning(f"policy_add warning (may already exist): {exc}")
+        raise   # ← RAISE so policy_set doesn't run blindly on a missing policy
+    finally:
+        os.unlink(tmp_path)   # ← always clean up temp file
+
+    # ── 3. Attach policy to user ──────────────────────────────────────────────
+    admin.policy_set(policy_name, user=access_key)
+    logger.info(f"✅ Policy '{policy_name}' attached to '{access_key}'")
+
+    # ── 4. Push to XCom ───────────────────────────────────────────────────────
+    ctx["ti"].xcom_push(key="minio_access_key", value=access_key)
+    ctx["ti"].xcom_push(key="minio_secret_key", value=secret_key)
+    ctx["ti"].xcom_push(key="minio_endpoint",   value=f"http://{MINIO_ENDPOINT}")
+    ctx["ti"].xcom_push(key="minio_bucket",     value=DVC_BUCKET)
+
+    logger.info(f"  researcher_id  : {researcher_id}")
+    logger.info(f"  access_key     : {access_key}")
+    logger.info(f"  policy         : {policy_name}")
+    logger.info("=== minio_user_setup DONE ===")
     # ── Correct import ────────────────────────────────────────────────────────
     from minio.minioadmin import MinioAdmin
     from minio.credentials import StaticProvider
