@@ -33,7 +33,7 @@ def _researcher_policy(researcher_id: str) -> str:
             {
                 "Sid":    "AllowListOwnPrefix",
                 "Effect": "Allow",
-                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Action": ["s3:ListBucket"],          # ← s3:prefix condition only valid here
                 "Resource": [f"arn:aws:s3:::{DVC_BUCKET}"],
                 "Condition": {
                     "StringLike": {
@@ -43,6 +43,12 @@ def _researcher_policy(researcher_id: str) -> str:
                         ]
                     }
                 },
+            },
+            {
+                "Sid":    "AllowGetBucketLocation",
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketLocation"],   # ← no condition, standalone
+                "Resource": [f"arn:aws:s3:::{DVC_BUCKET}"],
             },
             {
                 "Sid":    "AllowObjectOpsOwnPrefix",
