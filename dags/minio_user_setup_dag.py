@@ -7,7 +7,6 @@ import secrets
 import psycopg2
 import json
 import logging
-import io
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ def _researcher_policy(researcher_id: str) -> str:
             {
                 "Sid":    "AllowListOwnPrefix",
                 "Effect": "Allow",
-                "Action": ["s3:ListBucket"],          # ← s3:prefix condition only valid here
+                "Action": ["s3:ListBucket"],
                 "Resource": [f"arn:aws:s3:::{DVC_BUCKET}"],
                 "Condition": {
                     "StringLike": {
@@ -47,18 +46,18 @@ def _researcher_policy(researcher_id: str) -> str:
             {
                 "Sid":    "AllowGetBucketLocation",
                 "Effect": "Allow",
-                "Action": ["s3:GetBucketLocation"],   # ← no condition, standalone
+                "Action": ["s3:GetBucketLocation"],
                 "Resource": [f"arn:aws:s3:::{DVC_BUCKET}"],
             },
             {
                 "Sid":    "AllowObjectOpsOwnPrefix",
                 "Effect": "Allow",
                 "Action": [
-                    "s3:GetObject",
+                    "s3:GetObject",        # also covers HEAD requests
                     "s3:PutObject",
                     "s3:DeleteObject",
                     "s3:GetObjectVersion",
-                    "s3:HeadObject",
+                    # s3:HeadObject is NOT a valid MinIO IAM action
                 ],
                 "Resource": [f"arn:aws:s3:::{DVC_BUCKET}/{researcher_id}/*"],
             },
@@ -95,8 +94,6 @@ def _save_credentials(researcher_id: str, access_key: str, secret_key: str) -> N
             )
         conn.commit()
     logger.info(f"MinIO credentials persisted for '{researcher_id}'")
-
-
 
 
 def setup_minio_user(researcher_id, **ctx):
@@ -142,22 +139,20 @@ def setup_minio_user(researcher_id, **ctx):
         _save_credentials(researcher_id, access_key, secret_key)
 
     # ── 2. Create / update scoped IAM policy ─────────────────────────────────
-    # policy_add expects a FILE PATH (str), not a BytesIO or raw string
+    # policy_add expects a file path (str), not BytesIO or raw string
     policy_json = _researcher_policy(researcher_id)
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
         tmp.write(policy_json)
         tmp_path = tmp.name
 
     try:
-        admin.policy_add(policy_name, tmp_path)   # ← pass the file path
+        admin.policy_add(policy_name, tmp_path)
         logger.info(f"✅ Policy '{policy_name}' created/updated")
     except Exception as exc:
-        logger.warning(f"policy_add warning (may already exist): {exc}")
-        raise   # ← RAISE so policy_set doesn't run blindly on a missing policy
+        logger.error(f"policy_add failed: {exc}")
+        raise
     finally:
-        os.unlink(tmp_path)   # ← always clean up temp file
+        os.unlink(tmp_path)
 
     # ── 3. Attach policy to user ──────────────────────────────────────────────
     admin.policy_set(policy_name, user=access_key)
@@ -169,10 +164,15 @@ def setup_minio_user(researcher_id, **ctx):
     ctx["ti"].xcom_push(key="minio_endpoint",   value=f"http://{MINIO_ENDPOINT}")
     ctx["ti"].xcom_push(key="minio_bucket",     value=DVC_BUCKET)
 
+    logger.info("=" * 60)
     logger.info(f"  researcher_id  : {researcher_id}")
     logger.info(f"  access_key     : {access_key}")
     logger.info(f"  policy         : {policy_name}")
+    logger.info(f"  bucket         : {DVC_BUCKET}")
+    logger.info(f"  credentials_db : minio-postgresql-svc.mlops-minio:5432/miniodb")
+    logger.info("=" * 60)
     logger.info("=== minio_user_setup DONE ===")
+
 
 with DAG(
     dag_id="minio_user_setup_dag",
