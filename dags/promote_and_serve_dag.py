@@ -8,9 +8,25 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000")
-ADMIN_USER = "admin"
-ADMIN_PASS = "mlops-admin-2024"
+MLFLOW_URI   = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000")
+ADMIN_USER   = "admin"
+ADMIN_PASS   = "mlops-admin-2024"
+
+# ── Traefik config ────────────────────────────────────────────────────────────
+# The host Traefik is listening on (set in airflow/values.yaml env section).
+# e.g.  TRAEFIK_HOST=192.168.0.64   or   TRAEFIK_HOST=mlops.yourdomain.com
+TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        "192.168.0.64")
+TRAEFIK_ENTRYPOINT = os.environ.get("TRAEFIK_ENTRYPOINT",  "web")   # "web" = port 80
+
+# ── Traefik API group — use traefik.io for Traefik v3, traefik.containo.us for v2 ──
+TRAEFIK_GROUP      = os.environ.get("TRAEFIK_CRD_GROUP",   "traefik.io")
+
+
+def _serving_path(researcher_id: str, model_name: str) -> str:
+    """URL path prefix used by Traefik to route to this model's service."""
+    model_slug = model_name.replace("_", "-").lower()
+    rid_slug   = researcher_id.replace("_", "-").lower()
+    return f"/serving/{rid_slug}/{model_slug}"
 
 
 def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
@@ -25,7 +41,6 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     mlflow.set_tracking_uri(MLFLOW_URI)
     admin_client = MlflowClient(tracking_uri=MLFLOW_URI)
 
-    # ── Get model version ─────────────────────────────────────────────────────
     if version == "latest":
         versions = admin_client.get_latest_versions(model_name)
         if not versions:
@@ -36,7 +51,6 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
 
     logger.info(f"Found model version: {mv.version} run_id={mv.run_id}")
 
-    # ── Validate accuracy ─────────────────────────────────────────────────────
     run    = admin_client.get_run(mv.run_id)
     acc    = float(run.data.metrics.get("accuracy", 0))
     thresh = float(threshold)
@@ -45,7 +59,6 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     if acc < thresh:
         raise ValueError(f"accuracy {acc} is below threshold {thresh}")
 
-    # ── Promote to production ─────────────────────────────────────────────────
     admin_client.set_registered_model_alias(model_name, "production", mv.version)
     logger.info(f"✓ Alias 'production' → {model_name} v{mv.version}")
 
@@ -53,16 +66,125 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     logger.info("=== VALIDATE DONE ===")
 
 
-def launch_and_wait_healthy(model_name, **ctx):
+def _k8s_clients():
     from kubernetes import client as k8s, config as k8s_config
-
-    logger.info(f"=== DEPLOY SERVING POD | model={model_name} ===")
-
     k8s_config.load_incluster_config()
-    core_v1   = k8s.CoreV1Api()
-    namespace = "mlops-serving"
-    pod_name  = f"serve-{model_name.replace('_', '-').lower()}"
-    svc_name  = f"{pod_name}-svc"
+    return k8s.CoreV1Api(), k8s.CustomObjectsApi()
+
+
+def _create_or_replace_middleware(
+    custom_api,
+    namespace: str,
+    name: str,
+    strip_prefix: str,
+) -> None:
+    """
+    Create (or replace) a Traefik StripPrefix middleware.
+    Works with both traefik.io (v3) and traefik.containo.us (v2).
+    """
+    body = {
+        "apiVersion": f"{TRAEFIK_GROUP}/v1alpha1",
+        "kind": "Middleware",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "stripPrefix": {
+                "prefixes": [strip_prefix],
+                "forceSlash": False,
+            }
+        },
+    }
+    try:
+        custom_api.delete_namespaced_custom_object(
+            group=TRAEFIK_GROUP, version="v1alpha1",
+            namespace=namespace, plural="middlewares", name=name,
+        )
+        logger.info(f"Deleted old middleware: {name}")
+        time.sleep(1)
+    except Exception:
+        pass  # doesn't exist yet
+
+    custom_api.create_namespaced_custom_object(
+        group=TRAEFIK_GROUP, version="v1alpha1",
+        namespace=namespace, plural="middlewares", body=body,
+    )
+    logger.info(f"✓ Middleware created: {name}  strip={strip_prefix}")
+
+
+def _create_or_replace_ingressroute(
+    custom_api,
+    namespace: str,
+    name: str,
+    svc_name: str,
+    path_prefix: str,
+    middleware_name: str,
+) -> None:
+    """
+    Create (or replace) a Traefik IngressRoute for the serving pod.
+
+    Route: PathPrefix(`<path_prefix>`) → svc_name:8001
+    After stripping the prefix the container receives the request at /invocations.
+    """
+    # Build the host+path match rule.
+    # If TRAEFIK_HOST is set to an IP or hostname, scope to that host.
+    if TRAEFIK_HOST and TRAEFIK_HOST not in ("", "0.0.0.0"):
+        match_rule = f"Host(`{TRAEFIK_HOST}`) && PathPrefix(`{path_prefix}`)"
+    else:
+        match_rule = f"PathPrefix(`{path_prefix}`)"
+
+    body = {
+        "apiVersion": f"{TRAEFIK_GROUP}/v1alpha1",
+        "kind": "IngressRoute",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "entryPoints": [TRAEFIK_ENTRYPOINT],
+            "routes": [
+                {
+                    "match": match_rule,
+                    "kind": "Rule",
+                    "services": [
+                        {"name": svc_name, "port": 8001}
+                    ],
+                    "middlewares": [
+                        {"name": middleware_name, "namespace": namespace}
+                    ],
+                }
+            ],
+        },
+    }
+
+    try:
+        custom_api.delete_namespaced_custom_object(
+            group=TRAEFIK_GROUP, version="v1alpha1",
+            namespace=namespace, plural="ingressroutes", name=name,
+        )
+        logger.info(f"Deleted old IngressRoute: {name}")
+        time.sleep(1)
+    except Exception:
+        pass
+
+    custom_api.create_namespaced_custom_object(
+        group=TRAEFIK_GROUP, version="v1alpha1",
+        namespace=namespace, plural="ingressroutes", body=body,
+    )
+    logger.info(f"✓ IngressRoute created: {name}  match={match_rule}")
+
+
+def launch_and_wait_healthy(researcher_id, model_name, **ctx):
+    from kubernetes import client as k8s
+
+    logger.info(f"=== DEPLOY SERVING POD | model={model_name} researcher={researcher_id} ===")
+
+    core_v1, custom_api = _k8s_clients()
+
+    namespace    = "mlops-serving"
+    model_slug   = model_name.replace("_", "-").lower()
+    rid_slug     = researcher_id.replace("_", "-").lower()
+    pod_name     = f"serve-{model_slug}"
+    svc_name     = f"{pod_name}-svc"
+    mw_name      = f"strip-{pod_name}"
+    ir_name      = f"ingress-{pod_name}"
+    path_prefix  = _serving_path(researcher_id, model_name)
+    serving_url  = f"http://{TRAEFIK_HOST}{path_prefix}/invocations"
 
     # ── Delete old pod if exists ──────────────────────────────────────────────
     try:
@@ -78,7 +200,7 @@ def launch_and_wait_healthy(model_name, **ctx):
         metadata=k8s.V1ObjectMeta(
             name=pod_name,
             namespace=namespace,
-            labels={"app": pod_name, "model": model_name},
+            labels={"app": pod_name, "model": model_slug, "researcher": rid_slug},
         ),
         spec=k8s.V1PodSpec(
             restart_policy="Always",
@@ -139,6 +261,39 @@ def launch_and_wait_healthy(model_name, **ctx):
         else:
             raise
 
+    # ── Create Traefik StripPrefix Middleware ─────────────────────────────────
+    try:
+        _create_or_replace_middleware(
+            custom_api=custom_api,
+            namespace=namespace,
+            name=mw_name,
+            strip_prefix=path_prefix,
+        )
+    except Exception as exc:
+        # Non-fatal: Traefik CRDs might not be installed — log and continue.
+        # The pod will still be reachable via kubectl port-forward.
+        logger.warning(f"Could not create Middleware (Traefik CRDs installed?): {exc}")
+
+    # ── Create Traefik IngressRoute ───────────────────────────────────────────
+    try:
+        _create_or_replace_ingressroute(
+            custom_api=custom_api,
+            namespace=namespace,
+            name=ir_name,
+            svc_name=svc_name,
+            path_prefix=path_prefix,
+            middleware_name=mw_name,
+        )
+        logger.info(f"✓ Serving endpoint: http://{TRAEFIK_HOST}{path_prefix}/invocations")
+    except Exception as exc:
+        logger.warning(f"Could not create IngressRoute (Traefik CRDs installed?): {exc}")
+
+    # ── Push final URL to XCom ────────────────────────────────────────────────
+    ctx["ti"].xcom_push(key="serving_url",  value=serving_url)
+    ctx["ti"].xcom_push(key="path_prefix",  value=path_prefix)
+    ctx["ti"].xcom_push(key="pod_name",     value=pod_name)
+    ctx["ti"].xcom_push(key="svc_name",     value=svc_name)
+
     # ── Poll until Running + Ready ────────────────────────────────────────────
     logger.info("Waiting for pod to become Ready (max 5 min)...")
     for attempt in range(60):
@@ -151,10 +306,9 @@ def launch_and_wait_healthy(model_name, **ctx):
             ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
             if ready:
                 logger.info(f"✅ Pod {pod_name} is Running and Ready!")
-                logger.info(f"   Internal : http://{svc_name}.{namespace}.svc.cluster.local:8001/invocations")
-                logger.info(f"   Port-fwd : kubectl port-forward svc/{svc_name} 8001:8001 -n {namespace}")
-                return   # ← DAG task exits, pod keeps running
-
+                logger.info(f"   Traefik URL : http://{TRAEFIK_HOST}{path_prefix}/invocations")
+                logger.info(f"   Port-fwd    : kubectl port-forward svc/{svc_name} 8001:8001 -n {namespace}")
+                return
         elif phase in ("Failed", "Unknown"):
             raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
 
@@ -192,7 +346,8 @@ with DAG(
         task_id="deploy_serving_pod",
         python_callable=launch_and_wait_healthy,
         op_kwargs={
-            "model_name": model_name,
+            "researcher_id": researcher_id,
+            "model_name":    model_name,
         },
     )
 
