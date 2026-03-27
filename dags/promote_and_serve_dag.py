@@ -190,16 +190,9 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
 
     # serving_url is set after NodePort service is created below
 
-    # ── Delete old pod if exists ──────────────────────────────────────────────
-    try:
-        core_v1.delete_namespaced_pod(pod_name, namespace)
-        logger.info(f"Deleted old pod {pod_name}, waiting 3s...")
-        time.sleep(3)
-    except k8s.exceptions.ApiException as e:
-        if e.status != 404:
-            raise
-
-    # ── Create pod ────────────────────────────────────────────────────────────
+    # ── Pod spec ──────────────────────────────────────────────────────────────
+    # Each model has its own permanent pod. We never delete it.
+    # create_namespaced_pod is skipped if the pod already exists (409 → ignore).
     pod = k8s.V1Pod(
         metadata=k8s.V1ObjectMeta(
             name=pod_name,
@@ -243,14 +236,24 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
         ),
     )
 
-    core_v1.create_namespaced_pod(namespace, pod)
-    logger.info(f"✓ Pod {pod_name} created")
+    try:
+        core_v1.create_namespaced_pod(namespace, pod)
+        logger.info(f"✓ Pod {pod_name} created")
+    except k8s.exceptions.ApiException as e:
+        if e.status == 409:
+            logger.info(f"✓ Pod {pod_name} already exists — reusing it")
+        else:
+            raise
 
     # ── Create / update NodePort Service ─────────────────────────────────────
     # NodePort exposes the pod on every cluster node at node_port.
     # Access: http://<NODE_IP>:<node_port>/invocations  — no port-forward needed.
     # NodePort range is 30000-32767. We derive a stable port from the model name.
-    node_port = 30000 + (abs(hash(model_name)) % 2767)
+    # hashlib.md5 gives a stable value across Python restarts.
+    # Python's built-in hash() is randomized per-process (PYTHONHASHSEED)
+    # so it would assign a different NodePort every time Airflow restarts.
+    import hashlib
+    node_port = 30000 + (int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 2767)
 
     service = k8s.V1Service(
         metadata=k8s.V1ObjectMeta(
