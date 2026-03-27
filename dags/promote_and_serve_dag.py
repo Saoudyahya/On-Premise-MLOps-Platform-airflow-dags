@@ -12,14 +12,12 @@ MLFLOW_URI   = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-ml
 ADMIN_USER   = "admin"
 ADMIN_PASS   = "mlops-admin-2024"
 
-# ── Direct node access ────────────────────────────────────────────────────────
-# NODE_IP: the IP of the Kubernetes node where serving pods are scheduled.
-# hostPort maps the container port directly onto this IP — no ingress needed.
-# Each model gets its own port so multiple models can run simultaneously.
-# Port allocation: base 8100 + hash of model name, capped to range 8100-8199.
-# You can also set SERVING_HOST_PORT_BASE to shift the range.
-NODE_IP              = os.environ.get("NODE_IP",              "192.168.0.64")
-SERVING_HOST_PORT    = int(os.environ.get("SERVING_HOST_PORT", "8001"))
+# ── Node access ───────────────────────────────────────────────────────────────
+# NODE_IP: the IP of any Kubernetes node.
+# The DAG creates a NodePort service so the pod is reachable at
+# http://NODE_IP:<nodePort>/invocations from outside the cluster.
+# NodePort is auto-allocated in range 30000-32767 based on model name.
+NODE_IP = os.environ.get("NODE_IP", "192.168.0.64")
 
 # ── Traefik config (optional — used only if Traefik CRDs are present) ─────────
 TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        NODE_IP)
@@ -190,14 +188,7 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     ir_name      = f"ingress-{pod_name}"
     path_prefix  = _serving_path(researcher_id, model_name)
 
-    # ── Allocate a stable host port for this model ────────────────────────────
-    # deterministic offset 0-99 so each model gets its own port (8001-8100)
-    port_base   = int(os.environ.get("SERVING_HOST_PORT_BASE", str(SERVING_HOST_PORT)))
-    host_port   = port_base + (abs(hash(model_name)) % 100)
-
-    # Primary URL — direct node:hostPort, no ingress or port-forward needed
-    serving_url = f"http://{NODE_IP}:{host_port}/invocations"
-    logger.info(f"Node IP: {NODE_IP}  hostPort: {host_port}  serving_url: {serving_url}")
+    # serving_url is set after NodePort service is created below
 
     # ── Delete old pod if exists ──────────────────────────────────────────────
     try:
@@ -228,7 +219,7 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                         f"--model-uri 'models:/{model_name}@production' "
                         f"--host 0.0.0.0 --port 8001 --no-conda"
                     ],
-                    ports=[k8s.V1ContainerPort(container_port=8001, host_port=host_port)],
+                    ports=[k8s.V1ContainerPort(container_port=8001)],
                     env=[
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME", value=ADMIN_USER),
@@ -255,24 +246,44 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     core_v1.create_namespaced_pod(namespace, pod)
     logger.info(f"✓ Pod {pod_name} created")
 
-    # ── Create / update Service ───────────────────────────────────────────────
+    # ── Create / update NodePort Service ─────────────────────────────────────
+    # NodePort exposes the pod on every cluster node at node_port.
+    # Access: http://<NODE_IP>:<node_port>/invocations  — no port-forward needed.
+    # NodePort range is 30000-32767. We derive a stable port from the model name.
+    node_port = 30000 + (abs(hash(model_name)) % 2767)
+
     service = k8s.V1Service(
-        metadata=k8s.V1ObjectMeta(name=svc_name, namespace=namespace),
+        metadata=k8s.V1ObjectMeta(
+            name=svc_name,
+            namespace=namespace,
+            labels={"app": pod_name, "model": model_slug, "researcher": rid_slug},
+        ),
         spec=k8s.V1ServiceSpec(
+            type="NodePort",
             selector={"app": pod_name},
-            ports=[k8s.V1ServicePort(port=8001, target_port=8001)],
+            ports=[k8s.V1ServicePort(
+                port=8001,
+                target_port=8001,
+                node_port=node_port,
+            )],
         ),
     )
     try:
         core_v1.read_namespaced_service(svc_name, namespace)
-        core_v1.replace_namespaced_service(svc_name, namespace, service)
-        logger.info(f"✓ Service {svc_name} updated")
+        # NodePort cannot be patched in-place when type changes — delete and recreate
+        core_v1.delete_namespaced_service(svc_name, namespace)
+        logger.info(f"Deleted old service {svc_name}")
+        time.sleep(1)
     except k8s.exceptions.ApiException as e:
-        if e.status == 404:
-            core_v1.create_namespaced_service(namespace, service)
-            logger.info(f"✓ Service {svc_name} created")
-        else:
+        if e.status != 404:
             raise
+
+    core_v1.create_namespaced_service(namespace, service)
+    logger.info(f"✓ NodePort service {svc_name} created  nodePort={node_port}")
+
+    # Serving URL is now directly accessible via NodePort — no port-forward needed
+    serving_url = f"http://{NODE_IP}:{node_port}/invocations"
+    logger.info(f"✓ Serving URL: {serving_url}")
 
     # ── Create Traefik StripPrefix Middleware ─────────────────────────────────
     try:
