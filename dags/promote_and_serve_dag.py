@@ -320,7 +320,6 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     ctx["ti"].xcom_push(key="path_prefix",  value=path_prefix)
     ctx["ti"].xcom_push(key="pod_name",     value=pod_name)
     ctx["ti"].xcom_push(key="svc_name",     value=svc_name)
-    ctx["ti"].xcom_push(key="host_port",    value=str(host_port))
     ctx["ti"].xcom_push(key="node_ip",      value=NODE_IP)
 
     # ── Poll until Running + Ready ────────────────────────────────────────────
@@ -336,7 +335,6 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             if ready:
                 logger.info(f"✅ Pod {pod_name} is Running and Ready!")
                 logger.info(f"   Direct URL  : {serving_url}")
-                logger.info(f"   hostPort    : {host_port} on {NODE_IP}")
                 return
         elif phase in ("Failed", "Unknown"):
             raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
