@@ -12,13 +12,18 @@ MLFLOW_URI   = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-ml
 ADMIN_USER   = "admin"
 ADMIN_PASS   = "mlops-admin-2024"
 
-# ── Traefik config ────────────────────────────────────────────────────────────
-# The host Traefik is listening on (set in airflow/values.yaml env section).
-# e.g.  TRAEFIK_HOST=192.168.0.64   or   TRAEFIK_HOST=mlops.yourdomain.com
-TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        "192.168.0.64")
-TRAEFIK_ENTRYPOINT = os.environ.get("TRAEFIK_ENTRYPOINT",  "web")   # "web" = port 80
+# ── Direct node access ────────────────────────────────────────────────────────
+# NODE_IP: the IP of the Kubernetes node where serving pods are scheduled.
+# hostPort maps the container port directly onto this IP — no ingress needed.
+# Each model gets its own port so multiple models can run simultaneously.
+# Port allocation: base 8100 + hash of model name, capped to range 8100-8199.
+# You can also set SERVING_HOST_PORT_BASE to shift the range.
+NODE_IP              = os.environ.get("NODE_IP",              "192.168.0.64")
+SERVING_HOST_PORT    = int(os.environ.get("SERVING_HOST_PORT", "8001"))
 
-# ── Traefik API group — use traefik.io for Traefik v3, traefik.containo.us for v2 ──
+# ── Traefik config (optional — used only if Traefik CRDs are present) ─────────
+TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        NODE_IP)
+TRAEFIK_ENTRYPOINT = os.environ.get("TRAEFIK_ENTRYPOINT",  "web")
 TRAEFIK_GROUP      = os.environ.get("TRAEFIK_CRD_GROUP",   "traefik.io")
 
 
@@ -184,7 +189,15 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     mw_name      = f"strip-{pod_name}"
     ir_name      = f"ingress-{pod_name}"
     path_prefix  = _serving_path(researcher_id, model_name)
-    serving_url  = f"http://{TRAEFIK_HOST}{path_prefix}/invocations"
+
+    # ── Allocate a stable host port for this model ────────────────────────────
+    # deterministic offset 0-99 so each model gets its own port (8001-8100)
+    port_base   = int(os.environ.get("SERVING_HOST_PORT_BASE", str(SERVING_HOST_PORT)))
+    host_port   = port_base + (abs(hash(model_name)) % 100)
+
+    # Primary URL — direct node:hostPort, no ingress or port-forward needed
+    serving_url = f"http://{NODE_IP}:{host_port}/invocations"
+    logger.info(f"Node IP: {NODE_IP}  hostPort: {host_port}  serving_url: {serving_url}")
 
     # ── Delete old pod if exists ──────────────────────────────────────────────
     try:
@@ -215,7 +228,7 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                         f"--model-uri 'models:/{model_name}@production' "
                         f"--host 0.0.0.0 --port 8001 --no-conda"
                     ],
-                    ports=[k8s.V1ContainerPort(container_port=8001)],
+                    ports=[k8s.V1ContainerPort(container_port=8001, host_port=host_port)],
                     env=[
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME", value=ADMIN_USER),
@@ -293,6 +306,8 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     ctx["ti"].xcom_push(key="path_prefix",  value=path_prefix)
     ctx["ti"].xcom_push(key="pod_name",     value=pod_name)
     ctx["ti"].xcom_push(key="svc_name",     value=svc_name)
+    ctx["ti"].xcom_push(key="host_port",    value=str(host_port))
+    ctx["ti"].xcom_push(key="node_ip",      value=NODE_IP)
 
     # ── Poll until Running + Ready ────────────────────────────────────────────
     logger.info("Waiting for pod to become Ready (max 5 min)...")
@@ -306,8 +321,8 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
             if ready:
                 logger.info(f"✅ Pod {pod_name} is Running and Ready!")
-                logger.info(f"   Traefik URL : http://{TRAEFIK_HOST}{path_prefix}/invocations")
-                logger.info(f"   Port-fwd    : kubectl port-forward svc/{svc_name} 8001:8001 -n {namespace}")
+                logger.info(f"   Direct URL  : {serving_url}")
+                logger.info(f"   hostPort    : {host_port} on {NODE_IP}")
                 return
         elif phase in ("Failed", "Unknown"):
             raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
