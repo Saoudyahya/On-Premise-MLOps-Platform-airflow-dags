@@ -15,16 +15,6 @@ ADMIN_PASS   = "mlops-admin-2024"
 
 NODE_IP = os.environ.get("NODE_IP", "192.168.0.64")
 
-TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        NODE_IP)
-TRAEFIK_ENTRYPOINT = os.environ.get("TRAEFIK_ENTRYPOINT",  "web")
-TRAEFIK_GROUP      = os.environ.get("TRAEFIK_CRD_GROUP",   "traefik.io")
-
-
-def _serving_path(researcher_id: str, model_name: str) -> str:
-    model_slug = model_name.replace("_", "-").lower()
-    rid_slug   = researcher_id.replace("_", "-").lower()
-    return f"/serving/{rid_slug}/{model_slug}"
-
 
 def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
     import mlflow
@@ -74,49 +64,62 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
 
     logger.info(f"=== DEPLOY SERVING POD | model={model_name} researcher={researcher_id} ===")
 
-    core_v1, custom_api = _k8s_clients()
+    core_v1, _ = _k8s_clients()
 
-    namespace   = "mlops-serving"
-    model_slug  = model_name.replace("_", "-").lower()
-    rid_slug    = researcher_id.replace("_", "-").lower()
-    pod_name    = f"serve-{model_slug}"
-    svc_name    = f"{pod_name}-svc"
-    path_prefix = _serving_path(researcher_id, model_name)
+    namespace  = "mlops-serving"
+    model_slug = model_name.replace("_", "-").lower()
+    rid_slug   = researcher_id.replace("_", "-").lower()
+    pod_name   = f"serve-{rid_slug}-{model_slug}"
+    svc_name   = f"{pod_name}-svc"
 
-    # ── Stable NodePort for inference (8001) ─────────────────────────────────
+    # ── NodePort for inference (8080 — MLServer REST port) ────────────────────
     node_port = 30000 + (int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 2767)
 
-    # ── Stable NodePort for Prometheus metrics (8002) ─────────────────────────
-    # Offset by 1000 so it never collides with the inference port range
+    # ── NodePort for Prometheus metrics (8082 — MLServer built-in) ───────────
     metrics_node_port = 30000 + (int(hashlib.md5((model_name + "_metrics").encode()).hexdigest(), 16) % 2767)
-    # Ensure they don't collide (astronomically unlikely but guard anyway)
     if metrics_node_port == node_port:
         metrics_node_port = node_port + 1 if node_port < 32767 else node_port - 1
 
+    # MLServer /invocations is on port 8080
     serving_url = f"http://{NODE_IP}:{node_port}/invocations"
     logger.info(f"Inference NodePort : {node_port}  → {serving_url}")
     logger.info(f"Metrics  NodePort  : {metrics_node_port} → http://{NODE_IP}:{metrics_node_port}/metrics")
 
+    # ── Delete existing pod so we always get a fresh one with latest config ───
+    try:
+        core_v1.delete_namespaced_pod(pod_name, namespace)
+        logger.info(f"Deleted existing pod {pod_name}, waiting for termination...")
+        for _ in range(30):
+            time.sleep(2)
+            try:
+                core_v1.read_namespaced_pod(pod_name, namespace)
+            except k8s.exceptions.ApiException as e:
+                if e.status == 404:
+                    logger.info("Pod terminated.")
+                    break
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
     # ── Pod spec ──────────────────────────────────────────────────────────────
-    # Key change: prometheus_flask_exporter is added to the pip install so that
-    # MLflow's Flask app automatically exposes /metrics on port 8002.
-    # The exporter is auto-detected via the PROMETHEUS_MULTIPROC_DIR env var
-    # and the FLASK_APP hook — no code changes to MLflow are needed.
+    # --enable-mlserver tells MLflow to use MLServer as the backend instead of
+    # the plain Flask/uvicorn server. MLServer exposes Prometheus metrics
+    # natively on port 8082 at /metrics — no extra instrumentation needed.
+    #
+    # MLServer metric names: mlserver_requests_total, mlserver_request_duration_seconds, etc.
     pod = k8s.V1Pod(
         metadata=k8s.V1ObjectMeta(
             name=pod_name,
             namespace=namespace,
             labels={
-                "app":        pod_name,
-                "model":      model_slug,
-                "researcher": rid_slug,
-                # Prometheus ServiceMonitor selector label
+                "app":               pod_name,
+                "model":             f"{rid_slug}-{model_slug}",
+                "researcher":        rid_slug,
                 "prometheus-scrape": "true",
             },
             annotations={
-                # Prometheus pod-level auto-discovery annotations (works without ServiceMonitor)
                 "prometheus.io/scrape": "true",
-                "prometheus.io/port":   "8002",
+                "prometheus.io/port":   "8082",
                 "prometheus.io/path":   "/metrics",
             },
         ),
@@ -128,19 +131,19 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                     image="ghcr.io/mlflow/mlflow:v3.10.1",
                     command=["sh", "-c"],
                     args=[
-                        # Install prometheus_flask_exporter alongside the existing deps.
-                        # It auto-instruments Flask when imported, exposing /metrics on the
-                        # same process.  We bind the metrics endpoint to port 8002 via the
-                        # PROMETHEUS_FLASK_EXPORTER_PORT env var so it doesn't clash with
-                        # the inference port 8001.
-                        "pip install mlflow boto3 scikit-learn prometheus-flask-exporter --quiet && "
+                        # mlserver and mlserver-mlflow provide the MLServer runtime.
+                        # MLServer automatically starts /metrics on port 8082.
+                        "pip install mlflow boto3 scikit-learn mlserver mlserver-mlflow --quiet && "
                         "mlflow models serve "
                         f"--model-uri 'models:/{model_name}@production' "
-                        "--host 0.0.0.0 --port 8001 --no-conda"
+                        "--host 0.0.0.0 --port 8080 "
+                        "--enable-mlserver "
+                        "--no-conda"
                     ],
                     ports=[
-                        k8s.V1ContainerPort(container_port=8001, name="inference"),
-                        k8s.V1ContainerPort(container_port=8002, name="metrics"),
+                        k8s.V1ContainerPort(container_port=8080, name="inference"),
+                        k8s.V1ContainerPort(container_port=8081, name="grpc"),
+                        k8s.V1ContainerPort(container_port=8082, name="metrics"),
                     ],
                     env=[
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
@@ -149,44 +152,45 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                         k8s.V1EnvVar(name="AWS_ENDPOINT_URL",         value="http://minio-svc.mlops-minio.svc.cluster.local:9000"),
                         k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="minio-admin"),
                         k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="minio-admin"),
-                        # Tell prometheus_flask_exporter which port to bind /metrics on.
-                        # When this env var is set the exporter starts a separate WSGI
-                        # server on 8002 so /metrics never conflicts with /invocations.
-                        k8s.V1EnvVar(name="PROMETHEUS_FLASK_EXPORTER_PORT", value="8002"),
+                        # MLServer port config
+                        k8s.V1EnvVar(name="MLSERVER_HTTP_PORT",       value="8080"),
+                        k8s.V1EnvVar(name="MLSERVER_GRPC_PORT",       value="8081"),
+                        k8s.V1EnvVar(name="MLSERVER_METRICS_PORT",    value="8082"),
+                        k8s.V1EnvVar(name="MLSERVER_MODEL_NAME",      value=model_name),
                     ],
                     readiness_probe=k8s.V1Probe(
-                        http_get=k8s.V1HTTPGetAction(path="/health", port=8001),
-                        initial_delay_seconds=15,
-                        period_seconds=5,
-                        failure_threshold=10,
+                        http_get=k8s.V1HTTPGetAction(path="/v2/health/ready", port=8080),
+                        initial_delay_seconds=30,
+                        period_seconds=10,
+                        failure_threshold=12,
+                    ),
+                    liveness_probe=k8s.V1Probe(
+                        http_get=k8s.V1HTTPGetAction(path="/v2/health/live", port=8080),
+                        initial_delay_seconds=60,
+                        period_seconds=15,
+                        failure_threshold=6,
                     ),
                     resources=k8s.V1ResourceRequirements(
                         requests={"memory": "512Mi", "cpu": "250m"},
-                        limits={"memory": "1Gi",   "cpu": "500m"},
+                        limits={"memory": "2Gi",   "cpu": "1000m"},
                     ),
                 )
             ],
         ),
     )
 
-    try:
-        core_v1.create_namespaced_pod(namespace, pod)
-        logger.info(f"✓ Pod {pod_name} created")
-    except k8s.exceptions.ApiException as e:
-        if e.status == 409:
-            logger.info(f"✓ Pod {pod_name} already exists — reusing it")
-        else:
-            raise
+    core_v1.create_namespaced_pod(namespace, pod)
+    logger.info(f"✓ Pod {pod_name} created")
 
-    # ── Service: expose both inference (8001) and metrics (8002) ports ───────
+    # ── Service ───────────────────────────────────────────────────────────────
     service = k8s.V1Service(
         metadata=k8s.V1ObjectMeta(
             name=svc_name,
             namespace=namespace,
             labels={
-                "app":        pod_name,
-                "model":      model_slug,
-                "researcher": rid_slug,
+                "app":               pod_name,
+                "model":             f"{rid_slug}-{model_slug}",
+                "researcher":        rid_slug,
                 "prometheus-scrape": "true",
             },
         ),
@@ -196,14 +200,14 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             ports=[
                 k8s.V1ServicePort(
                     name="inference",
-                    port=8001,
-                    target_port=8001,
+                    port=8080,
+                    target_port=8080,
                     node_port=node_port,
                 ),
                 k8s.V1ServicePort(
                     name="metrics",
-                    port=8002,
-                    target_port=8002,
+                    port=8082,
+                    target_port=8082,
                     node_port=metrics_node_port,
                 ),
             ],
@@ -220,9 +224,9 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             raise
 
     core_v1.create_namespaced_service(namespace, service)
-    logger.info(f"✓ NodePort service {svc_name} created  inferencePort={node_port}  metricsPort={metrics_node_port}")
+    logger.info(f"✓ Service {svc_name} created  inference={node_port}  metrics={metrics_node_port}")
 
-    # ── Push to XCom ──────────────────────────────────────────────────────────
+    # ── XCom ─────────────────────────────────────────────────────────────────
     ctx["ti"].xcom_push(key="serving_url",       value=serving_url)
     ctx["ti"].xcom_push(key="metrics_url",       value=f"http://{NODE_IP}:{metrics_node_port}/metrics")
     ctx["ti"].xcom_push(key="metrics_node_port", value=metrics_node_port)
@@ -231,9 +235,9 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     ctx["ti"].xcom_push(key="svc_name",          value=svc_name)
     ctx["ti"].xcom_push(key="node_ip",           value=NODE_IP)
 
-    # ── Poll until Running + Ready ────────────────────────────────────────────
-    logger.info("Waiting for pod to become Ready (max 5 min)...")
-    for attempt in range(60):
+    # ── Poll until Ready ──────────────────────────────────────────────────────
+    logger.info("Waiting for pod to become Ready (max 10 min)...")
+    for attempt in range(120):
         time.sleep(5)
         pod_status = core_v1.read_namespaced_pod(pod_name, namespace)
         phase      = pod_status.status.phase
@@ -243,15 +247,59 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
             if ready:
                 logger.info(f"✅ Pod {pod_name} is Running and Ready!")
-                logger.info(f"   Inference URL : {serving_url}")
-                logger.info(f"   Metrics URL   : http://{NODE_IP}:{metrics_node_port}/metrics")
+                logger.info(f"   Inference : {serving_url}")
+                logger.info(f"   Metrics   : http://{NODE_IP}:{metrics_node_port}/metrics")
                 return
         elif phase in ("Failed", "Unknown"):
             raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
 
-        logger.info(f"[{attempt+1}/60] phase={phase} — waiting...")
+        logger.info(f"[{attempt+1}/120] phase={phase} — waiting...")
 
-    raise TimeoutError(f"Pod {pod_name} did not become Ready within 5 minutes")
+    raise TimeoutError(f"Pod {pod_name} did not become Ready within 10 minutes")
+
+
+def save_serving_job_to_db(researcher_id, model_name, **ctx):
+    """Persist the serving job to the MLflow PostgreSQL DB so the UI can list it."""
+    import psycopg2
+
+    ti          = ctx["ti"]
+    pod_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")
+    svc_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="svc_name")
+    serving_url = ti.xcom_pull(task_ids="deploy_serving_pod", key="serving_url")
+    dag_run_id  = ctx["dag_run"].run_id
+    version     = ti.xcom_pull(task_ids="validate_and_promote", key="model_version") or "latest"
+
+    db_host = os.environ.get("MLFLOW_DB_HOST", "mlflow-postgresql-svc.mlops-mlflow.svc.cluster.local")
+    db_port = os.environ.get("MLFLOW_DB_PORT", "5432")
+    db_name = os.environ.get("MLFLOW_DB_NAME", "mlflow")
+    db_user = os.environ.get("MLFLOW_DB_USER", "mlflow")
+    db_pass = os.environ.get("MLFLOW_DB_PASSWORD", "mlflow-password")
+
+    conn = psycopg2.connect(
+        host=db_host, port=db_port, dbname=db_name,
+        user=db_user, password=db_pass, connect_timeout=10,
+        options="-c lc_messages=C",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO researcher_serving_jobs
+                    (researcher_id, model_name, version, dag_run_id,
+                     pod_name, svc_name, state, ready, serving_url)
+                VALUES (%s, %s, %s, %s, %s, %s, 'success', true, %s)
+                ON CONFLICT (dag_run_id) DO UPDATE
+                    SET state       = 'success',
+                        ready       = true,
+                        pod_name    = EXCLUDED.pod_name,
+                        svc_name    = EXCLUDED.svc_name,
+                        serving_url = EXCLUDED.serving_url,
+                        updated_at  = NOW()
+            """, (researcher_id, model_name, version, dag_run_id,
+                  pod_name, svc_name, serving_url))
+        conn.commit()
+        logger.info(f"✓ Serving job saved: dag_run_id={dag_run_id} pod={pod_name}")
+    finally:
+        conn.close()
 
 
 with DAG(
@@ -288,4 +336,13 @@ with DAG(
         },
     )
 
-    t1 >> t2
+    t3 = PythonOperator(
+        task_id="save_serving_job",
+        python_callable=save_serving_job_to_db,
+        op_kwargs={
+            "researcher_id": researcher_id,
+            "model_name":    model_name,
+        },
+    )
+
+    t1 >> t2 >> t3
