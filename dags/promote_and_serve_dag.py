@@ -153,10 +153,15 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                         k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="minio-admin"),
                         k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="minio-admin"),
                         # MLServer port config
-                        k8s.V1EnvVar(name="MLSERVER_HTTP_PORT",       value="8080"),
-                        k8s.V1EnvVar(name="MLSERVER_GRPC_PORT",       value="8081"),
-                        k8s.V1EnvVar(name="MLSERVER_METRICS_PORT",    value="8082"),
-                        k8s.V1EnvVar(name="MLSERVER_MODEL_NAME",      value=model_name),
+                        k8s.V1EnvVar(name="MLSERVER_HTTP_PORT",          value="8080"),
+                        k8s.V1EnvVar(name="MLSERVER_GRPC_PORT",          value="8081"),
+                        k8s.V1EnvVar(name="MLSERVER_METRICS_PORT",       value="8082"),
+                        k8s.V1EnvVar(name="MLSERVER_MODEL_NAME",         value=model_name),
+                        # Fix: MLServer parallel workers crash on Python 3.10 due to
+                        # uvloop RuntimeError("There is no current event loop").
+                        # Setting workers=0 disables the multiprocess pool and runs
+                        # inference directly in the main async loop — fine for single-model pods.
+                        k8s.V1EnvVar(name="MLSERVER_PARALLEL_WORKERS",   value="0"),
                     ],
                     readiness_probe=k8s.V1Probe(
                         http_get=k8s.V1HTTPGetAction(path="/v2/health/ready", port=8080),
