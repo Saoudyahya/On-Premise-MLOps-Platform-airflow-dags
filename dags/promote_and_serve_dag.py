@@ -5,6 +5,7 @@ from mlflow import MlflowClient
 import os
 import time
 import logging
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -12,21 +13,14 @@ MLFLOW_URI   = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-ml
 ADMIN_USER   = "admin"
 ADMIN_PASS   = "mlops-admin-2024"
 
-# ── Node access ───────────────────────────────────────────────────────────────
-# NODE_IP: the IP of any Kubernetes node.
-# The DAG creates a NodePort service so the pod is reachable at
-# http://NODE_IP:<nodePort>/invocations from outside the cluster.
-# NodePort is auto-allocated in range 30000-32767 based on model name.
 NODE_IP = os.environ.get("NODE_IP", "192.168.0.64")
 
-# ── Traefik config (optional — used only if Traefik CRDs are present) ─────────
 TRAEFIK_HOST       = os.environ.get("TRAEFIK_HOST",        NODE_IP)
 TRAEFIK_ENTRYPOINT = os.environ.get("TRAEFIK_ENTRYPOINT",  "web")
 TRAEFIK_GROUP      = os.environ.get("TRAEFIK_CRD_GROUP",   "traefik.io")
 
 
 def _serving_path(researcher_id: str, model_name: str) -> str:
-    """URL path prefix used by Traefik to route to this model's service."""
     model_slug = model_name.replace("_", "-").lower()
     rid_slug   = researcher_id.replace("_", "-").lower()
     return f"/serving/{rid_slug}/{model_slug}"
@@ -75,103 +69,6 @@ def _k8s_clients():
     return k8s.CoreV1Api(), k8s.CustomObjectsApi()
 
 
-def _create_or_replace_middleware(
-    custom_api,
-    namespace: str,
-    name: str,
-    strip_prefix: str,
-) -> None:
-    """
-    Create (or replace) a Traefik StripPrefix middleware.
-    Works with both traefik.io (v3) and traefik.containo.us (v2).
-    """
-    body = {
-        "apiVersion": f"{TRAEFIK_GROUP}/v1alpha1",
-        "kind": "Middleware",
-        "metadata": {"name": name, "namespace": namespace},
-        "spec": {
-            "stripPrefix": {
-                "prefixes": [strip_prefix],
-                "forceSlash": False,
-            }
-        },
-    }
-    try:
-        custom_api.delete_namespaced_custom_object(
-            group=TRAEFIK_GROUP, version="v1alpha1",
-            namespace=namespace, plural="middlewares", name=name,
-        )
-        logger.info(f"Deleted old middleware: {name}")
-        time.sleep(1)
-    except Exception:
-        pass  # doesn't exist yet
-
-    custom_api.create_namespaced_custom_object(
-        group=TRAEFIK_GROUP, version="v1alpha1",
-        namespace=namespace, plural="middlewares", body=body,
-    )
-    logger.info(f"✓ Middleware created: {name}  strip={strip_prefix}")
-
-
-def _create_or_replace_ingressroute(
-    custom_api,
-    namespace: str,
-    name: str,
-    svc_name: str,
-    path_prefix: str,
-    middleware_name: str,
-) -> None:
-    """
-    Create (or replace) a Traefik IngressRoute for the serving pod.
-
-    Route: PathPrefix(`<path_prefix>`) → svc_name:8001
-    After stripping the prefix the container receives the request at /invocations.
-    """
-    # Build the host+path match rule.
-    # If TRAEFIK_HOST is set to an IP or hostname, scope to that host.
-    if TRAEFIK_HOST and TRAEFIK_HOST not in ("", "0.0.0.0"):
-        match_rule = f"Host(`{TRAEFIK_HOST}`) && PathPrefix(`{path_prefix}`)"
-    else:
-        match_rule = f"PathPrefix(`{path_prefix}`)"
-
-    body = {
-        "apiVersion": f"{TRAEFIK_GROUP}/v1alpha1",
-        "kind": "IngressRoute",
-        "metadata": {"name": name, "namespace": namespace},
-        "spec": {
-            "entryPoints": [TRAEFIK_ENTRYPOINT],
-            "routes": [
-                {
-                    "match": match_rule,
-                    "kind": "Rule",
-                    "services": [
-                        {"name": svc_name, "port": 8001}
-                    ],
-                    "middlewares": [
-                        {"name": middleware_name, "namespace": namespace}
-                    ],
-                }
-            ],
-        },
-    }
-
-    try:
-        custom_api.delete_namespaced_custom_object(
-            group=TRAEFIK_GROUP, version="v1alpha1",
-            namespace=namespace, plural="ingressroutes", name=name,
-        )
-        logger.info(f"Deleted old IngressRoute: {name}")
-        time.sleep(1)
-    except Exception:
-        pass
-
-    custom_api.create_namespaced_custom_object(
-        group=TRAEFIK_GROUP, version="v1alpha1",
-        namespace=namespace, plural="ingressroutes", body=body,
-    )
-    logger.info(f"✓ IngressRoute created: {name}  match={match_rule}")
-
-
 def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     from kubernetes import client as k8s
 
@@ -179,25 +76,49 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
 
     core_v1, custom_api = _k8s_clients()
 
-    namespace    = "mlops-serving"
-    model_slug   = model_name.replace("_", "-").lower()
-    rid_slug     = researcher_id.replace("_", "-").lower()
-    pod_name     = f"serve-{model_slug}"
-    svc_name     = f"{pod_name}-svc"
-    mw_name      = f"strip-{pod_name}"
-    ir_name      = f"ingress-{pod_name}"
-    path_prefix  = _serving_path(researcher_id, model_name)
+    namespace   = "mlops-serving"
+    model_slug  = model_name.replace("_", "-").lower()
+    rid_slug    = researcher_id.replace("_", "-").lower()
+    pod_name    = f"serve-{model_slug}"
+    svc_name    = f"{pod_name}-svc"
+    path_prefix = _serving_path(researcher_id, model_name)
 
-    # serving_url is set after NodePort service is created below
+    # ── Stable NodePort for inference (8001) ─────────────────────────────────
+    node_port = 30000 + (int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 2767)
+
+    # ── Stable NodePort for Prometheus metrics (8002) ─────────────────────────
+    # Offset by 1000 so it never collides with the inference port range
+    metrics_node_port = 30000 + (int(hashlib.md5((model_name + "_metrics").encode()).hexdigest(), 16) % 2767)
+    # Ensure they don't collide (astronomically unlikely but guard anyway)
+    if metrics_node_port == node_port:
+        metrics_node_port = node_port + 1 if node_port < 32767 else node_port - 1
+
+    serving_url = f"http://{NODE_IP}:{node_port}/invocations"
+    logger.info(f"Inference NodePort : {node_port}  → {serving_url}")
+    logger.info(f"Metrics  NodePort  : {metrics_node_port} → http://{NODE_IP}:{metrics_node_port}/metrics")
 
     # ── Pod spec ──────────────────────────────────────────────────────────────
-    # Each model has its own permanent pod. We never delete it.
-    # create_namespaced_pod is skipped if the pod already exists (409 → ignore).
+    # Key change: prometheus_flask_exporter is added to the pip install so that
+    # MLflow's Flask app automatically exposes /metrics on port 8002.
+    # The exporter is auto-detected via the PROMETHEUS_MULTIPROC_DIR env var
+    # and the FLASK_APP hook — no code changes to MLflow are needed.
     pod = k8s.V1Pod(
         metadata=k8s.V1ObjectMeta(
             name=pod_name,
             namespace=namespace,
-            labels={"app": pod_name, "model": model_slug, "researcher": rid_slug},
+            labels={
+                "app":        pod_name,
+                "model":      model_slug,
+                "researcher": rid_slug,
+                # Prometheus ServiceMonitor selector label
+                "prometheus-scrape": "true",
+            },
+            annotations={
+                # Prometheus pod-level auto-discovery annotations (works without ServiceMonitor)
+                "prometheus.io/scrape": "true",
+                "prometheus.io/port":   "8002",
+                "prometheus.io/path":   "/metrics",
+            },
         ),
         spec=k8s.V1PodSpec(
             restart_policy="Always",
@@ -207,12 +128,20 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                     image="ghcr.io/mlflow/mlflow:v3.10.1",
                     command=["sh", "-c"],
                     args=[
-                        f"pip install mlflow boto3 scikit-learn --quiet && "
-                        f"mlflow models serve "
+                        # Install prometheus_flask_exporter alongside the existing deps.
+                        # It auto-instruments Flask when imported, exposing /metrics on the
+                        # same process.  We bind the metrics endpoint to port 8002 via the
+                        # PROMETHEUS_FLASK_EXPORTER_PORT env var so it doesn't clash with
+                        # the inference port 8001.
+                        "pip install mlflow boto3 scikit-learn prometheus-flask-exporter --quiet && "
+                        "mlflow models serve "
                         f"--model-uri 'models:/{model_name}@production' "
-                        f"--host 0.0.0.0 --port 8001 --no-conda"
+                        "--host 0.0.0.0 --port 8001 --no-conda"
                     ],
-                    ports=[k8s.V1ContainerPort(container_port=8001)],
+                    ports=[
+                        k8s.V1ContainerPort(container_port=8001, name="inference"),
+                        k8s.V1ContainerPort(container_port=8002, name="metrics"),
+                    ],
                     env=[
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
                         k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME", value=ADMIN_USER),
@@ -220,6 +149,10 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                         k8s.V1EnvVar(name="AWS_ENDPOINT_URL",         value="http://minio-svc.mlops-minio.svc.cluster.local:9000"),
                         k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="minio-admin"),
                         k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="minio-admin"),
+                        # Tell prometheus_flask_exporter which port to bind /metrics on.
+                        # When this env var is set the exporter starts a separate WSGI
+                        # server on 8002 so /metrics never conflicts with /invocations.
+                        k8s.V1EnvVar(name="PROMETHEUS_FLASK_EXPORTER_PORT", value="8002"),
                     ],
                     readiness_probe=k8s.V1Probe(
                         http_get=k8s.V1HTTPGetAction(path="/health", port=8001),
@@ -245,35 +178,40 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
         else:
             raise
 
-    # ── Create / update NodePort Service ─────────────────────────────────────
-    # NodePort exposes the pod on every cluster node at node_port.
-    # Access: http://<NODE_IP>:<node_port>/invocations  — no port-forward needed.
-    # NodePort range is 30000-32767. We derive a stable port from the model name.
-    # hashlib.md5 gives a stable value across Python restarts.
-    # Python's built-in hash() is randomized per-process (PYTHONHASHSEED)
-    # so it would assign a different NodePort every time Airflow restarts.
-    import hashlib
-    node_port = 30000 + (int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 2767)
-
+    # ── Service: expose both inference (8001) and metrics (8002) ports ───────
     service = k8s.V1Service(
         metadata=k8s.V1ObjectMeta(
             name=svc_name,
             namespace=namespace,
-            labels={"app": pod_name, "model": model_slug, "researcher": rid_slug},
+            labels={
+                "app":        pod_name,
+                "model":      model_slug,
+                "researcher": rid_slug,
+                "prometheus-scrape": "true",
+            },
         ),
         spec=k8s.V1ServiceSpec(
             type="NodePort",
             selector={"app": pod_name},
-            ports=[k8s.V1ServicePort(
-                port=8001,
-                target_port=8001,
-                node_port=node_port,
-            )],
+            ports=[
+                k8s.V1ServicePort(
+                    name="inference",
+                    port=8001,
+                    target_port=8001,
+                    node_port=node_port,
+                ),
+                k8s.V1ServicePort(
+                    name="metrics",
+                    port=8002,
+                    target_port=8002,
+                    node_port=metrics_node_port,
+                ),
+            ],
         ),
     )
+
     try:
         core_v1.read_namespaced_service(svc_name, namespace)
-        # NodePort cannot be patched in-place when type changes — delete and recreate
         core_v1.delete_namespaced_service(svc_name, namespace)
         logger.info(f"Deleted old service {svc_name}")
         time.sleep(1)
@@ -282,45 +220,16 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             raise
 
     core_v1.create_namespaced_service(namespace, service)
-    logger.info(f"✓ NodePort service {svc_name} created  nodePort={node_port}")
+    logger.info(f"✓ NodePort service {svc_name} created  inferencePort={node_port}  metricsPort={metrics_node_port}")
 
-    # Serving URL is now directly accessible via NodePort — no port-forward needed
-    serving_url = f"http://{NODE_IP}:{node_port}/invocations"
-    logger.info(f"✓ Serving URL: {serving_url}")
-
-    # ── Create Traefik StripPrefix Middleware ─────────────────────────────────
-    try:
-        _create_or_replace_middleware(
-            custom_api=custom_api,
-            namespace=namespace,
-            name=mw_name,
-            strip_prefix=path_prefix,
-        )
-    except Exception as exc:
-        # Non-fatal: Traefik CRDs might not be installed — log and continue.
-        # The pod will still be reachable via kubectl port-forward.
-        logger.warning(f"Could not create Middleware (Traefik CRDs installed?): {exc}")
-
-    # ── Create Traefik IngressRoute ───────────────────────────────────────────
-    try:
-        _create_or_replace_ingressroute(
-            custom_api=custom_api,
-            namespace=namespace,
-            name=ir_name,
-            svc_name=svc_name,
-            path_prefix=path_prefix,
-            middleware_name=mw_name,
-        )
-        logger.info(f"✓ Serving endpoint: http://{TRAEFIK_HOST}{path_prefix}/invocations")
-    except Exception as exc:
-        logger.warning(f"Could not create IngressRoute (Traefik CRDs installed?): {exc}")
-
-    # ── Push final URL to XCom ────────────────────────────────────────────────
-    ctx["ti"].xcom_push(key="serving_url",  value=serving_url)
-    ctx["ti"].xcom_push(key="path_prefix",  value=path_prefix)
-    ctx["ti"].xcom_push(key="pod_name",     value=pod_name)
-    ctx["ti"].xcom_push(key="svc_name",     value=svc_name)
-    ctx["ti"].xcom_push(key="node_ip",      value=NODE_IP)
+    # ── Push to XCom ──────────────────────────────────────────────────────────
+    ctx["ti"].xcom_push(key="serving_url",       value=serving_url)
+    ctx["ti"].xcom_push(key="metrics_url",       value=f"http://{NODE_IP}:{metrics_node_port}/metrics")
+    ctx["ti"].xcom_push(key="metrics_node_port", value=metrics_node_port)
+    ctx["ti"].xcom_push(key="node_port",         value=node_port)
+    ctx["ti"].xcom_push(key="pod_name",          value=pod_name)
+    ctx["ti"].xcom_push(key="svc_name",          value=svc_name)
+    ctx["ti"].xcom_push(key="node_ip",           value=NODE_IP)
 
     # ── Poll until Running + Ready ────────────────────────────────────────────
     logger.info("Waiting for pod to become Ready (max 5 min)...")
@@ -334,7 +243,8 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
             ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
             if ready:
                 logger.info(f"✅ Pod {pod_name} is Running and Ready!")
-                logger.info(f"   Direct URL  : {serving_url}")
+                logger.info(f"   Inference URL : {serving_url}")
+                logger.info(f"   Metrics URL   : http://{NODE_IP}:{metrics_node_port}/metrics")
                 return
         elif phase in ("Failed", "Unknown"):
             raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
