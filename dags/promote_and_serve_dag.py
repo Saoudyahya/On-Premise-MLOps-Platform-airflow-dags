@@ -133,7 +133,7 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
                     args=[
                         # mlserver and mlserver-mlflow provide the MLServer runtime.
                         # MLServer automatically starts /metrics on port 8082.
-                        "pip install mlflow boto3 scikit-learn mlserver mlserver-mlflow --quiet && "
+                        "pip install mlflow boto3 scikit-learn mlserver mlserver-mlflow 'uvloop<0.22' --quiet && "
                         "mlflow models serve "
                         f"--model-uri 'models:/{model_name}@production' "
                         "--host 0.0.0.0 --port 8080 "
