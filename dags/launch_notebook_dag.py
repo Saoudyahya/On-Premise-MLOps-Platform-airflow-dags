@@ -41,11 +41,10 @@ def _get_username(researcher_id: str) -> str:
                 (researcher_id,),
             )
             row = cur.fetchone()
-
     if row is None:
         raise RuntimeError(
             f"No JupyterHub credentials found for researcher '{researcher_id}'. "
-            "Run POST /api/notebook/setup (jupyter_user_setup_dag) first."
+            "Run POST /api/notebook/setup first."
         )
     return row[0]
 
@@ -67,10 +66,10 @@ def _upsert_notebook_record(
                      notebook_url, status, dag_run_id)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (researcher_id, notebook_name) DO UPDATE
-                    SET status           = EXCLUDED.status,
-                        notebook_url     = EXCLUDED.notebook_url,
-                        dag_run_id       = EXCLUDED.dag_run_id,
-                        updated_at       = NOW()
+                    SET status       = EXCLUDED.status,
+                        notebook_url = EXCLUDED.notebook_url,
+                        dag_run_id   = EXCLUDED.dag_run_id,
+                        updated_at   = NOW()
                 """,
                 (researcher_id, notebook_name, username, notebook_url, status, dag_run_id),
             )
@@ -78,23 +77,48 @@ def _upsert_notebook_record(
     logger.info(f"researcher_notebooks updated: {researcher_id}/{notebook_name} → {status}")
 
 
-def spawn_named_server(researcher_id, notebook_name, **ctx):
+def spawn_named_server(researcher_id, notebook_name,
+                       cpu_request, cpu_limit,
+                       memory_request, memory_limit, **ctx):
     """
-    Start a JupyterHub named server for this researcher.
+    Start a JupyterHub named server with the requested resource profile.
 
-    Each unique notebook_name creates its own independent pod — a researcher
-    can have multiple notebooks running at the same time (up to
-    named_server_limit_per_user in jupyterhub/values.yaml, currently 5).
+    Resources are passed as KubeSpawner user_options so JupyterHub's
+    profile_list or kubespawner_override can apply them to the pod spec.
+    Requires the following in jupyterhub/values.yaml:
 
-    Only the exact (username, notebook_name) pair is checked; all other
-    named servers for this researcher are untouched.
+        hub:
+          extraConfig:
+            resource-overrides: |
+              from kubespawner import KubeSpawner
+
+              def apply_resource_profile(spawner):
+                  opts = spawner.user_options or {}
+                  cpu_req = opts.get("cpu_request", "500m")
+                  cpu_lim = opts.get("cpu_limit",   "1000m")
+                  mem_req = opts.get("memory_request", "1Gi")
+                  mem_lim = opts.get("memory_limit",   "1Gi")
+                  spawner.cpu_guarantee  = _cpu_to_float(cpu_req)
+                  spawner.cpu_limit      = _cpu_to_float(cpu_lim)
+                  spawner.mem_guarantee  = mem_req
+                  spawner.mem_limit      = mem_lim
+
+              def _cpu_to_float(s):
+                  if str(s).endswith("m"):
+                      return float(s[:-1]) / 1000
+                  return float(s)
+
+              c.KubeSpawner.pre_spawn_hook = apply_resource_profile
     """
-    logger.info(f"=== spawn_named_server | researcher={researcher_id} notebook={notebook_name} ===")
+    logger.info(
+        f"=== spawn_named_server | researcher={researcher_id} notebook={notebook_name} "
+        f"cpu={cpu_request}-{cpu_limit} mem={memory_request}-{memory_limit} ==="
+    )
 
-    username    = _get_username(researcher_id)
-    token       = get_admin_token()
-    headers     = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-    dag_run_id  = ctx["dag_run"].run_id
+    username   = _get_username(researcher_id)
+    token      = get_admin_token()
+    headers    = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+    dag_run_id = ctx["dag_run"].run_id
 
     _upsert_notebook_record(
         researcher_id=researcher_id,
@@ -105,7 +129,6 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
     )
 
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
-
     if r.status_code == 404:
         raise RuntimeError(
             f"User '{username}' not found in JupyterHub. "
@@ -115,14 +138,10 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
 
     servers = r.json().get("servers", {})
 
-    # ── Guard: this specific named server is already alive — do nothing ───────
-    # Only this (username, notebook_name) pair is inspected.
-    # All other named servers for this researcher continue running undisturbed.
     if notebook_name in servers:
         server_state = servers[notebook_name]
         if server_state.get("ready"):
             logger.info(f"Named server '{notebook_name}' already running — skipping spawn")
-            # Keep the DB record fresh
             _upsert_notebook_record(
                 researcher_id=researcher_id,
                 notebook_name=notebook_name,
@@ -136,18 +155,31 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
         logger.info(f"Named server '{notebook_name}' already pending={pending} — letting poll task wait")
         return
 
-    # ── Spawn the new named server ────────────────────────────────────────────
-    logger.info(f"Spawning: POST /hub/api/users/{username}/servers/{notebook_name}")
+    # ── Spawn with resource user_options ──────────────────────────────────────
+    # JupyterHub forwards user_options to KubeSpawner.  The pre_spawn_hook
+    # (configured in extraConfig above) reads them and applies resource limits.
+    spawn_body = {
+        "user_options": {
+            "cpu_request":    cpu_request,
+            "cpu_limit":      cpu_limit,
+            "memory_request": memory_request,
+            "memory_limit":   memory_limit,
+        }
+    }
+
+    logger.info(
+        f"Spawning: POST /hub/api/users/{username}/servers/{notebook_name} "
+        f"body={spawn_body}"
+    )
     r = requests.post(
         f"{JUPYTERHUB_API}/users/{username}/servers/{notebook_name}",
         headers=headers,
-        json={},
+        json=spawn_body,
         timeout=30,
     )
 
     logger.info(f"Spawn response: {r.status_code} — {r.text}")
 
-    # 201 = created, 202 = accepted/pending, 200 = already exists (race condition)
     if r.status_code in (200, 201, 202):
         logger.info(f"Named server '{notebook_name}' spawn accepted (HTTP {r.status_code})")
     else:
@@ -160,10 +192,7 @@ def spawn_named_server(researcher_id, notebook_name, **ctx):
 
 
 def poll_until_ready(researcher_id, notebook_name, **ctx):
-    """
-    Poll the Hub API until the named server is ready, then update the
-    researcher_notebooks table so Django can return the URL immediately.
-    """
+    """Poll until the named server is ready, then update the DB."""
     logger.info(f"=== poll_until_ready | researcher={researcher_id} notebook={notebook_name} ===")
 
     username = _get_username(researcher_id)
@@ -202,11 +231,7 @@ def poll_until_ready(researcher_id, notebook_name, **ctx):
             ctx["ti"].xcom_push(key="notebook_url",  value=notebook_url)
             ctx["ti"].xcom_push(key="notebook_name", value=notebook_name)
 
-            logger.info("=" * 60)
-            logger.info(f"  researcher_id : {researcher_id}")
-            logger.info(f"  notebook_name : {notebook_name}")
-            logger.info(f"  notebook_url  : {notebook_url}")
-            logger.info("=" * 60)
+            logger.info(f"  notebook_url: {notebook_url}")
             logger.info("=== poll_until_ready DONE ===")
             return
 
@@ -227,15 +252,23 @@ with DAG(
     tags=["notebook"],
 ) as dag:
 
-    researcher_id = "{{ dag_run.conf['researcher_id'] }}"
-    notebook_name = "{{ dag_run.conf['notebook_name'] }}"
+    researcher_id  = "{{ dag_run.conf['researcher_id'] }}"
+    notebook_name  = "{{ dag_run.conf['notebook_name'] }}"
+    cpu_request    = "{{ dag_run.conf.get('cpu_request',    '500m')  }}"
+    cpu_limit      = "{{ dag_run.conf.get('cpu_limit',      '1000m') }}"
+    memory_request = "{{ dag_run.conf.get('memory_request', '1Gi')   }}"
+    memory_limit   = "{{ dag_run.conf.get('memory_limit',   '1Gi')   }}"
 
     t1 = PythonOperator(
         task_id="spawn_named_server",
         python_callable=spawn_named_server,
         op_kwargs={
-            "researcher_id": researcher_id,
-            "notebook_name": notebook_name,
+            "researcher_id":  researcher_id,
+            "notebook_name":  notebook_name,
+            "cpu_request":    cpu_request,
+            "cpu_limit":      cpu_limit,
+            "memory_request": memory_request,
+            "memory_limit":   memory_limit,
         },
     )
 
