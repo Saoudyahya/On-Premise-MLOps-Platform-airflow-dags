@@ -49,33 +49,30 @@ def _get_username(researcher_id: str) -> str:
     return row[0]
 
 
+# add profile param to _upsert_notebook_record
 def _upsert_notebook_record(
-    researcher_id: str,
-    notebook_name: str,
-    username: str,
-    status: str,
-    notebook_url: str = "",
-    dag_run_id: str = "",
-) -> None:
+    researcher_id, notebook_name, username,
+    status, notebook_url="", dag_run_id="", profile="small"   # ← add
+):
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO researcher_notebooks
                     (researcher_id, notebook_name, jupyter_username,
-                     notebook_url, status, dag_run_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                     notebook_url, status, dag_run_id, profile)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (researcher_id, notebook_name) DO UPDATE
                     SET status       = EXCLUDED.status,
                         notebook_url = EXCLUDED.notebook_url,
                         dag_run_id   = EXCLUDED.dag_run_id,
+                        profile      = EXCLUDED.profile,
                         updated_at   = NOW()
                 """,
-                (researcher_id, notebook_name, username, notebook_url, status, dag_run_id),
+                (researcher_id, notebook_name, username,
+                 notebook_url, status, dag_run_id, profile),  # ← add
             )
         conn.commit()
-    logger.info(f"researcher_notebooks updated: {researcher_id}/{notebook_name} → {status}")
-
 
 def spawn_named_server(researcher_id, notebook_name,
                        cpu_request, cpu_limit,
