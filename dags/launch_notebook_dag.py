@@ -49,10 +49,9 @@ def _get_username(researcher_id: str) -> str:
     return row[0]
 
 
-# add profile param to _upsert_notebook_record
 def _upsert_notebook_record(
     researcher_id, notebook_name, username,
-    status, notebook_url="", dag_run_id="", profile="small"   # ← add
+    status, notebook_url="", dag_run_id="", profile="small"
 ):
     with psycopg2.connect(HUB_DB_DSN) as conn:
         with conn.cursor() as cur:
@@ -70,46 +69,18 @@ def _upsert_notebook_record(
                         updated_at   = NOW()
                 """,
                 (researcher_id, notebook_name, username,
-                 notebook_url, status, dag_run_id, profile),  # ← add
+                 notebook_url, status, dag_run_id, profile),
             )
         conn.commit()
+    logger.info(f"researcher_notebooks updated: {researcher_id}/{notebook_name} → {status} (profile={profile})")
+
 
 def spawn_named_server(researcher_id, notebook_name,
                        cpu_request, cpu_limit,
-                       memory_request, memory_limit, **ctx):
-    """
-    Start a JupyterHub named server with the requested resource profile.
-
-    Resources are passed as KubeSpawner user_options so JupyterHub's
-    profile_list or kubespawner_override can apply them to the pod spec.
-    Requires the following in jupyterhub/values.yaml:
-
-        hub:
-          extraConfig:
-            resource-overrides: |
-              from kubespawner import KubeSpawner
-
-              def apply_resource_profile(spawner):
-                  opts = spawner.user_options or {}
-                  cpu_req = opts.get("cpu_request", "500m")
-                  cpu_lim = opts.get("cpu_limit",   "1000m")
-                  mem_req = opts.get("memory_request", "1Gi")
-                  mem_lim = opts.get("memory_limit",   "1Gi")
-                  spawner.cpu_guarantee  = _cpu_to_float(cpu_req)
-                  spawner.cpu_limit      = _cpu_to_float(cpu_lim)
-                  spawner.mem_guarantee  = mem_req
-                  spawner.mem_limit      = mem_lim
-
-              def _cpu_to_float(s):
-                  if str(s).endswith("m"):
-                      return float(s[:-1]) / 1000
-                  return float(s)
-
-              c.KubeSpawner.pre_spawn_hook = apply_resource_profile
-    """
+                       memory_request, memory_limit, profile, **ctx):
     logger.info(
         f"=== spawn_named_server | researcher={researcher_id} notebook={notebook_name} "
-        f"cpu={cpu_request}-{cpu_limit} mem={memory_request}-{memory_limit} ==="
+        f"cpu={cpu_request}-{cpu_limit} mem={memory_request}-{memory_limit} profile={profile} ==="
     )
 
     username   = _get_username(researcher_id)
@@ -123,6 +94,7 @@ def spawn_named_server(researcher_id, notebook_name,
         username=username,
         status="starting",
         dag_run_id=dag_run_id,
+        profile=profile,
     )
 
     r = requests.get(f"{JUPYTERHUB_API}/users/{username}", headers=headers, timeout=10)
@@ -146,20 +118,18 @@ def spawn_named_server(researcher_id, notebook_name,
                 status="running",
                 notebook_url=f"{JUPYTERHUB_PUBLIC_URL}/user/{username}/{notebook_name}/lab",
                 dag_run_id=dag_run_id,
+                profile=profile,
             )
             return
         pending = server_state.get("pending")
         logger.info(f"Named server '{notebook_name}' already pending={pending} — letting poll task wait")
         return
 
-    # ── Spawn with resource user_options ──────────────────────────────────────
-    # JupyterHub forwards user_options to KubeSpawner.  The pre_spawn_hook
-    # (configured in extraConfig above) reads them and applies resource limits.
     spawn_body = {
-    "cpu_request":    cpu_request,
-    "cpu_limit":      cpu_limit,
-    "memory_request": memory_request,
-    "memory_limit":   memory_limit,
+        "cpu_request":    cpu_request,
+        "cpu_limit":      cpu_limit,
+        "memory_request": memory_request,
+        "memory_limit":   memory_limit,
     }
 
     logger.info(
@@ -186,7 +156,7 @@ def spawn_named_server(researcher_id, notebook_name,
     logger.info("=== spawn_named_server DONE ===")
 
 
-def poll_until_ready(researcher_id, notebook_name, **ctx):
+def poll_until_ready(researcher_id, notebook_name, profile, **ctx):
     """Poll until the named server is ready, then update the DB."""
     logger.info(f"=== poll_until_ready | researcher={researcher_id} notebook={notebook_name} ===")
 
@@ -221,6 +191,7 @@ def poll_until_ready(researcher_id, notebook_name, **ctx):
                 status="running",
                 notebook_url=notebook_url,
                 dag_run_id=ctx["dag_run"].run_id,
+                profile=profile,
             )
 
             ctx["ti"].xcom_push(key="notebook_url",  value=notebook_url)
@@ -253,6 +224,7 @@ with DAG(
     cpu_limit      = "{{ dag_run.conf.get('cpu_limit',      '1000m') }}"
     memory_request = "{{ dag_run.conf.get('memory_request', '1Gi')   }}"
     memory_limit   = "{{ dag_run.conf.get('memory_limit',   '1Gi')   }}"
+    profile        = "{{ dag_run.conf.get('profile', 'small') }}"
 
     t1 = PythonOperator(
         task_id="spawn_named_server",
@@ -264,6 +236,7 @@ with DAG(
             "cpu_limit":      cpu_limit,
             "memory_request": memory_request,
             "memory_limit":   memory_limit,
+            "profile":        profile,
         },
     )
 
@@ -273,6 +246,7 @@ with DAG(
         op_kwargs={
             "researcher_id": researcher_id,
             "notebook_name": notebook_name,
+            "profile":       profile,
         },
     )
 
