@@ -159,12 +159,10 @@ def spawn_named_server(researcher_id, notebook_name,
     # JupyterHub forwards user_options to KubeSpawner.  The pre_spawn_hook
     # (configured in extraConfig above) reads them and applies resource limits.
     spawn_body = {
-        "user_options": {
-            "cpu_request":    cpu_request,
-            "cpu_limit":      cpu_limit,
-            "memory_request": memory_request,
-            "memory_limit":   memory_limit,
-        }
+    "cpu_request":    cpu_request,
+    "cpu_limit":      cpu_limit,
+    "memory_request": memory_request,
+    "memory_limit":   memory_limit,
     }
 
     logger.info(
