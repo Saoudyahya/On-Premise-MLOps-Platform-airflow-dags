@@ -9,9 +9,9 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
-MLFLOW_URI   = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000")
-ADMIN_USER   = "admin"
-ADMIN_PASS   = "mlops-admin-2024"
+MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-svc.mlops-mlflow.svc.cluster.local:5000")
+ADMIN_USER = "admin"
+ADMIN_PASS = "mlops-admin-2024"
 
 NODE_IP = os.environ.get("NODE_IP", "192.168.0.64")
 
@@ -56,165 +56,186 @@ def validate_and_promote(researcher_id, model_name, version, threshold, **ctx):
 def _k8s_clients():
     from kubernetes import client as k8s, config as k8s_config
     k8s_config.load_incluster_config()
-    return k8s.CoreV1Api(), k8s.CustomObjectsApi()
+    return (
+        k8s.CoreV1Api(),
+        k8s.AppsV1Api(),
+        k8s.AutoscalingV2Api(),
+    )
 
 
-def launch_and_wait_healthy(researcher_id, model_name, **ctx):
+def launch_and_wait_healthy(researcher_id, model_name,
+                             replicas=1,
+                             hpa_enabled=False,
+                             hpa_min_replicas=1,
+                             hpa_max_replicas=5,
+                             hpa_cpu_target=70,
+                             **ctx):
     from kubernetes import client as k8s
 
-    logger.info(f"=== DEPLOY SERVING POD | model={model_name} researcher={researcher_id} ===")
+    # Normalise types — Airflow Jinja renders everything as strings
+    replicas         = int(replicas)
+    hpa_enabled      = str(hpa_enabled).lower() in ("true", "1", "yes")
+    hpa_min_replicas = int(hpa_min_replicas)
+    hpa_max_replicas = int(hpa_max_replicas)
+    hpa_cpu_target   = int(hpa_cpu_target)
 
-    core_v1, _ = _k8s_clients()
+    logger.info(
+        f"=== DEPLOY SERVING DEPLOYMENT | model={model_name} researcher={researcher_id} "
+        f"replicas={replicas} hpa={hpa_enabled} "
+        f"hpa_range=[{hpa_min_replicas},{hpa_max_replicas}] cpu_target={hpa_cpu_target}% ==="
+    )
 
-    namespace  = "mlops-serving"
-    model_slug = model_name.replace("_", "-").lower()
-    rid_slug   = researcher_id.replace("_", "-").lower()
-    pod_name   = f"serve-{rid_slug}-{model_slug}"
-    svc_name   = f"{pod_name}-svc"
+    core_v1, apps_v1, autoscaling_v2 = _k8s_clients()
 
-    # ── NodePort for inference (8080 — MLServer REST port) ────────────────────
+    namespace   = "mlops-serving"
+    model_slug  = model_name.replace("_", "-").lower()
+    rid_slug    = researcher_id.replace("_", "-").lower()
+    deploy_name = f"serve-{rid_slug}-{model_slug}"
+    svc_name    = f"{deploy_name}-svc"
+    hpa_name    = f"{deploy_name}-hpa"
+
+    # NodePort assignments
     node_port = 30000 + (int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 2767)
-
-    # ── NodePort for Prometheus metrics (8082 — MLServer built-in) ───────────
     metrics_node_port = 30000 + (int(hashlib.md5((model_name + "_metrics").encode()).hexdigest(), 16) % 2767)
     if metrics_node_port == node_port:
         metrics_node_port = node_port + 1 if node_port < 32767 else node_port - 1
 
-    # MLServer /invocations is on port 8080
     serving_url = f"http://{NODE_IP}:{node_port}/invocations"
     logger.info(f"Inference NodePort : {node_port}  → {serving_url}")
     logger.info(f"Metrics  NodePort  : {metrics_node_port} → http://{NODE_IP}:{metrics_node_port}/metrics")
 
-    # ── Delete existing pod so we always get a fresh one with latest config ───
+    # ── 1. Delete existing HPA first (must precede Deployment deletion) ───────
     try:
-        core_v1.delete_namespaced_pod(pod_name, namespace)
-        logger.info(f"Deleted existing pod {pod_name}, waiting for termination...")
+        autoscaling_v2.delete_namespaced_horizontal_pod_autoscaler(hpa_name, namespace)
+        logger.info(f"Deleted existing HPA {hpa_name}")
+    except k8s.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+    # ── 2. Delete existing Deployment (Foreground — waits for pods to die) ────
+    try:
+        apps_v1.delete_namespaced_deployment(
+            deploy_name, namespace,
+            body=k8s.V1DeleteOptions(propagation_policy="Foreground"),
+        )
+        logger.info(f"Deleted existing Deployment {deploy_name}, waiting for termination…")
         for _ in range(30):
-            time.sleep(2)
+            time.sleep(3)
             try:
-                core_v1.read_namespaced_pod(pod_name, namespace)
+                apps_v1.read_namespaced_deployment(deploy_name, namespace)
             except k8s.exceptions.ApiException as e:
                 if e.status == 404:
-                    logger.info("Pod terminated.")
+                    logger.info("Deployment terminated.")
                     break
     except k8s.exceptions.ApiException as e:
         if e.status != 404:
             raise
 
-    # ── Pod spec ──────────────────────────────────────────────────────────────
-    # --enable-mlserver tells MLflow to use MLServer as the backend instead of
-    # the plain Flask/uvicorn server. MLServer exposes Prometheus metrics
-    # natively on port 8082 at /metrics — no extra instrumentation needed.
-    #
-    # MLServer metric names: mlserver_requests_total, mlserver_request_duration_seconds, etc.
-    pod = k8s.V1Pod(
-        metadata=k8s.V1ObjectMeta(
-            name=pod_name,
-            namespace=namespace,
-            labels={
-                "app":               pod_name,
-                "model":             f"{rid_slug}-{model_slug}",
-                "researcher":        rid_slug,
-                "prometheus-scrape": "true",
-            },
-            annotations={
-                "prometheus.io/scrape": "true",
-                "prometheus.io/port":   "8082",
-                "prometheus.io/path":   "/metrics",
-            },
+    # ── 3. Shared labels ──────────────────────────────────────────────────────
+    labels = {
+        "app":               deploy_name,
+        "model":             f"{rid_slug}-{model_slug}",
+        "researcher":        rid_slug,
+        "prometheus-scrape": "true",
+    }
+    pod_annotations = {
+        "prometheus.io/scrape": "true",
+        "prometheus.io/port":   "8082",
+        "prometheus.io/path":   "/metrics",
+    }
+
+    # ── 4. Container spec ─────────────────────────────────────────────────────
+    container = k8s.V1Container(
+        name="mlflow-serve",
+        image="ghcr.io/mlflow/mlflow:v3.10.1",
+        command=["sh", "-c"],
+        args=[
+            "pip install mlflow boto3 scikit-learn mlserver mlserver-mlflow 'uvloop<0.22' --quiet && "
+            "mlflow models serve "
+            f"--model-uri 'models:/{model_name}@production' "
+            "--host 0.0.0.0 --port 8080 "
+            "--enable-mlserver "
+            "--no-conda"
+        ],
+        ports=[
+            k8s.V1ContainerPort(container_port=8080, name="inference"),
+            k8s.V1ContainerPort(container_port=8081, name="grpc"),
+            k8s.V1ContainerPort(container_port=8082, name="metrics"),
+        ],
+        env=[
+            k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",       value=MLFLOW_URI),
+            k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME",  value=ADMIN_USER),
+            k8s.V1EnvVar(name="MLFLOW_TRACKING_PASSWORD",  value=ADMIN_PASS),
+            k8s.V1EnvVar(name="AWS_ENDPOINT_URL",          value="http://minio-svc.mlops-minio.svc.cluster.local:9000"),
+            k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",         value="minio-admin"),
+            k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",     value="minio-admin"),
+            k8s.V1EnvVar(name="MLSERVER_HTTP_PORT",        value="8080"),
+            k8s.V1EnvVar(name="MLSERVER_GRPC_PORT",        value="8081"),
+            k8s.V1EnvVar(name="MLSERVER_METRICS_PORT",     value="8082"),
+            k8s.V1EnvVar(name="MLSERVER_MODEL_NAME",       value=model_name),
+            k8s.V1EnvVar(name="MLSERVER_PARALLEL_WORKERS", value="0"),
+        ],
+        readiness_probe=k8s.V1Probe(
+            http_get=k8s.V1HTTPGetAction(path="/v2/health/ready", port=8080),
+            initial_delay_seconds=30,
+            period_seconds=10,
+            failure_threshold=12,
         ),
-        spec=k8s.V1PodSpec(
-            restart_policy="Always",
-            containers=[
-                k8s.V1Container(
-                    name="mlflow-serve",
-                    image="ghcr.io/mlflow/mlflow:v3.10.1",
-                    command=["sh", "-c"],
-                    args=[
-                        # mlserver and mlserver-mlflow provide the MLServer runtime.
-                        # MLServer automatically starts /metrics on port 8082.
-                        "pip install mlflow boto3 scikit-learn mlserver mlserver-mlflow 'uvloop<0.22' --quiet && "
-                        "mlflow models serve "
-                        f"--model-uri 'models:/{model_name}@production' "
-                        "--host 0.0.0.0 --port 8080 "
-                        "--enable-mlserver "
-                        "--no-conda"
-                    ],
-                    ports=[
-                        k8s.V1ContainerPort(container_port=8080, name="inference"),
-                        k8s.V1ContainerPort(container_port=8081, name="grpc"),
-                        k8s.V1ContainerPort(container_port=8082, name="metrics"),
-                    ],
-                    env=[
-                        k8s.V1EnvVar(name="MLFLOW_TRACKING_URI",      value=MLFLOW_URI),
-                        k8s.V1EnvVar(name="MLFLOW_TRACKING_USERNAME", value=ADMIN_USER),
-                        k8s.V1EnvVar(name="MLFLOW_TRACKING_PASSWORD", value=ADMIN_PASS),
-                        k8s.V1EnvVar(name="AWS_ENDPOINT_URL",         value="http://minio-svc.mlops-minio.svc.cluster.local:9000"),
-                        k8s.V1EnvVar(name="AWS_ACCESS_KEY_ID",        value="minio-admin"),
-                        k8s.V1EnvVar(name="AWS_SECRET_ACCESS_KEY",    value="minio-admin"),
-                        # MLServer port config
-                        k8s.V1EnvVar(name="MLSERVER_HTTP_PORT",          value="8080"),
-                        k8s.V1EnvVar(name="MLSERVER_GRPC_PORT",          value="8081"),
-                        k8s.V1EnvVar(name="MLSERVER_METRICS_PORT",       value="8082"),
-                        k8s.V1EnvVar(name="MLSERVER_MODEL_NAME",         value=model_name),
-                        # Fix: MLServer parallel workers crash on Python 3.10 due to
-                        # uvloop RuntimeError("There is no current event loop").
-                        # Setting workers=0 disables the multiprocess pool and runs
-                        # inference directly in the main async loop — fine for single-model pods.
-                        k8s.V1EnvVar(name="MLSERVER_PARALLEL_WORKERS",   value="0"),
-                    ],
-                    readiness_probe=k8s.V1Probe(
-                        http_get=k8s.V1HTTPGetAction(path="/v2/health/ready", port=8080),
-                        initial_delay_seconds=30,
-                        period_seconds=10,
-                        failure_threshold=12,
-                    ),
-                    liveness_probe=k8s.V1Probe(
-                        http_get=k8s.V1HTTPGetAction(path="/v2/health/live", port=8080),
-                        initial_delay_seconds=60,
-                        period_seconds=15,
-                        failure_threshold=6,
-                    ),
-                    resources=k8s.V1ResourceRequirements(
-                        requests={"memory": "512Mi", "cpu": "250m"},
-                        limits={"memory": "2Gi",   "cpu": "1000m"},
-                    ),
-                )
-            ],
+        liveness_probe=k8s.V1Probe(
+            http_get=k8s.V1HTTPGetAction(path="/v2/health/live", port=8080),
+            initial_delay_seconds=60,
+            period_seconds=15,
+            failure_threshold=6,
+        ),
+        resources=k8s.V1ResourceRequirements(
+            requests={"memory": "512Mi", "cpu": "250m"},
+            limits={"memory": "2Gi",   "cpu": "1000m"},
         ),
     )
 
-    core_v1.create_namespaced_pod(namespace, pod)
-    logger.info(f"✓ Pod {pod_name} created")
-
-    # ── Service ───────────────────────────────────────────────────────────────
-    service = k8s.V1Service(
+    # ── 5. Create Deployment ──────────────────────────────────────────────────
+    deployment = k8s.V1Deployment(
         metadata=k8s.V1ObjectMeta(
-            name=svc_name,
+            name=deploy_name,
             namespace=namespace,
-            labels={
-                "app":               pod_name,
-                "model":             f"{rid_slug}-{model_slug}",
-                "researcher":        rid_slug,
-                "prometheus-scrape": "true",
-            },
+            labels=labels,
+            annotations=pod_annotations,
         ),
+        spec=k8s.V1DeploymentSpec(
+            replicas=replicas,
+            selector=k8s.V1LabelSelector(match_labels={"app": deploy_name}),
+            strategy=k8s.V1DeploymentStrategy(
+                type="RollingUpdate",
+                rolling_update=k8s.V1RollingUpdateDeployment(
+                    max_surge=1,
+                    max_unavailable=0,
+                ),
+            ),
+            template=k8s.V1PodTemplateSpec(
+                metadata=k8s.V1ObjectMeta(
+                    labels=labels,
+                    annotations=pod_annotations,
+                ),
+                spec=k8s.V1PodSpec(
+                    restart_policy="Always",
+                    containers=[container],
+                ),
+            ),
+        ),
+    )
+
+    apps_v1.create_namespaced_deployment(namespace, deployment)
+    logger.info(f"✓ Deployment {deploy_name} created (replicas={replicas})")
+
+    # ── 6. Create / recreate Service ─────────────────────────────────────────
+    service = k8s.V1Service(
+        metadata=k8s.V1ObjectMeta(name=svc_name, namespace=namespace, labels=labels),
         spec=k8s.V1ServiceSpec(
             type="NodePort",
-            selector={"app": pod_name},
+            selector={"app": deploy_name},
             ports=[
-                k8s.V1ServicePort(
-                    name="inference",
-                    port=8080,
-                    target_port=8080,
-                    node_port=node_port,
-                ),
-                k8s.V1ServicePort(
-                    name="metrics",
-                    port=8082,
-                    target_port=8082,
-                    node_port=metrics_node_port,
-                ),
+                k8s.V1ServicePort(name="inference", port=8080, target_port=8080, node_port=node_port),
+                k8s.V1ServicePort(name="metrics",   port=8082, target_port=8082, node_port=metrics_node_port),
             ],
         ),
     )
@@ -222,7 +243,7 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     try:
         core_v1.read_namespaced_service(svc_name, namespace)
         core_v1.delete_namespaced_service(svc_name, namespace)
-        logger.info(f"Deleted old service {svc_name}")
+        logger.info(f"Deleted old Service {svc_name}")
         time.sleep(1)
     except k8s.exceptions.ApiException as e:
         if e.status != 404:
@@ -231,36 +252,92 @@ def launch_and_wait_healthy(researcher_id, model_name, **ctx):
     core_v1.create_namespaced_service(namespace, service)
     logger.info(f"✓ Service {svc_name} created  inference={node_port}  metrics={metrics_node_port}")
 
-    # ── XCom ─────────────────────────────────────────────────────────────────
+    # ── 7. Create HPA if requested ────────────────────────────────────────────
+    if hpa_enabled:
+        # Enforce: min_replicas must be <= initial replicas (or HPA will fight deployment)
+        effective_min = min(hpa_min_replicas, replicas)
+
+        hpa_metrics = [
+            k8s.V2MetricSpec(
+                type="Resource",
+                resource=k8s.V2ResourceMetricSource(
+                    name="cpu",
+                    target=k8s.V2MetricTarget(
+                        type="Utilization",
+                        average_utilization=hpa_cpu_target,
+                    ),
+                ),
+            )
+        ]
+
+        hpa = k8s.V2HorizontalPodAutoscaler(
+            metadata=k8s.V1ObjectMeta(name=hpa_name, namespace=namespace, labels=labels),
+            spec=k8s.V2HorizontalPodAutoscalerSpec(
+                scale_target_ref=k8s.V2CrossVersionObjectReference(
+                    api_version="apps/v1",
+                    kind="Deployment",
+                    name=deploy_name,
+                ),
+                min_replicas=effective_min,
+                max_replicas=hpa_max_replicas,
+                metrics=hpa_metrics,
+                behavior=k8s.V2HorizontalPodAutoscalerBehavior(
+                    scale_up=k8s.V2HPAScalingRules(
+                        stabilization_window_seconds=60,
+                        policies=[
+                            k8s.V2HPAScalingPolicy(type="Pods", value=2, period_seconds=60),
+                        ],
+                    ),
+                    scale_down=k8s.V2HPAScalingRules(
+                        stabilization_window_seconds=300,   # 5 min cool-down on scale-down
+                        policies=[
+                            k8s.V2HPAScalingPolicy(type="Pods", value=1, period_seconds=120),
+                        ],
+                    ),
+                ),
+            ),
+        )
+        autoscaling_v2.create_namespaced_horizontal_pod_autoscaler(namespace, hpa)
+        logger.info(
+            f"✓ HPA {hpa_name} created  "
+            f"cpu_target={hpa_cpu_target}%  "
+            f"replicas=[{effective_min},{hpa_max_replicas}]"
+        )
+
+    # ── 8. Push XCom ─────────────────────────────────────────────────────────
     ctx["ti"].xcom_push(key="serving_url",       value=serving_url)
     ctx["ti"].xcom_push(key="metrics_url",       value=f"http://{NODE_IP}:{metrics_node_port}/metrics")
     ctx["ti"].xcom_push(key="metrics_node_port", value=metrics_node_port)
     ctx["ti"].xcom_push(key="node_port",         value=node_port)
-    ctx["ti"].xcom_push(key="pod_name",          value=pod_name)
+    # NOTE: pod_name now holds the Deployment name.
+    # Prometheus queries use the `app=<deploy_name>` label, which aggregates all replicas.
+    ctx["ti"].xcom_push(key="pod_name",          value=deploy_name)
     ctx["ti"].xcom_push(key="svc_name",          value=svc_name)
     ctx["ti"].xcom_push(key="node_ip",           value=NODE_IP)
+    ctx["ti"].xcom_push(key="replicas",          value=replicas)
+    ctx["ti"].xcom_push(key="hpa_enabled",       value=hpa_enabled)
+    ctx["ti"].xcom_push(key="hpa_min_replicas",  value=hpa_min_replicas if hpa_enabled else None)
+    ctx["ti"].xcom_push(key="hpa_max_replicas",  value=hpa_max_replicas if hpa_enabled else None)
+    ctx["ti"].xcom_push(key="hpa_cpu_target",    value=hpa_cpu_target   if hpa_enabled else None)
 
-    # ── Poll until Ready ──────────────────────────────────────────────────────
-    logger.info("Waiting for pod to become Ready (max 10 min)...")
+    # ── 9. Poll until Deployment has ≥1 ready replica ────────────────────────
+    logger.info("Waiting for Deployment to have Ready replicas (max 10 min)…")
     for attempt in range(120):
         time.sleep(5)
-        pod_status = core_v1.read_namespaced_pod(pod_name, namespace)
-        phase      = pod_status.status.phase
+        dep     = apps_v1.read_namespaced_deployment(deploy_name, namespace)
+        ready   = dep.status.ready_replicas or 0
+        desired = dep.spec.replicas or replicas
+        logger.info(f"[{attempt+1}/120] ready={ready}/{desired}")
 
-        if phase == "Running":
-            conditions = pod_status.status.conditions or []
-            ready      = any(c.type == "Ready" and c.status == "True" for c in conditions)
-            if ready:
-                logger.info(f"✅ Pod {pod_name} is Running and Ready!")
-                logger.info(f"   Inference : {serving_url}")
-                logger.info(f"   Metrics   : http://{NODE_IP}:{metrics_node_port}/metrics")
-                return
-        elif phase in ("Failed", "Unknown"):
-            raise RuntimeError(f"Pod {pod_name} entered phase: {phase}")
+        if ready >= 1:
+            logger.info(f"✅ Deployment {deploy_name} is Ready! ({ready}/{desired} replicas)")
+            logger.info(f"   Inference : {serving_url}")
+            logger.info(f"   Metrics   : http://{NODE_IP}:{metrics_node_port}/metrics")
+            if hpa_enabled:
+                logger.info(f"   HPA       : {hpa_name}  cpu={hpa_cpu_target}%  [{hpa_min_replicas},{hpa_max_replicas}]")
+            return
 
-        logger.info(f"[{attempt+1}/120] phase={phase} — waiting...")
-
-    raise TimeoutError(f"Pod {pod_name} did not become Ready within 10 minutes")
+    raise TimeoutError(f"Deployment {deploy_name} did not reach Ready state within 10 minutes")
 
 
 def save_serving_job_to_db(researcher_id, model_name, **ctx):
@@ -268,11 +345,13 @@ def save_serving_job_to_db(researcher_id, model_name, **ctx):
     import psycopg2
 
     ti          = ctx["ti"]
-    pod_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")
+    pod_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")    # deployment name
     svc_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="svc_name")
     serving_url = ti.xcom_pull(task_ids="deploy_serving_pod", key="serving_url")
     dag_run_id  = ctx["dag_run"].run_id
     version     = ti.xcom_pull(task_ids="validate_and_promote", key="model_version") or "latest"
+    replicas    = ti.xcom_pull(task_ids="deploy_serving_pod", key="replicas") or 1
+    hpa_enabled = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_enabled") or False
 
     db_host = os.environ.get("MLFLOW_DB_HOST", "mlflow-postgresql-svc.mlops-mlflow.svc.cluster.local")
     db_port = os.environ.get("MLFLOW_DB_PORT", "5432")
@@ -302,7 +381,10 @@ def save_serving_job_to_db(researcher_id, model_name, **ctx):
             """, (researcher_id, model_name, version, dag_run_id,
                   pod_name, svc_name, serving_url))
         conn.commit()
-        logger.info(f"✓ Serving job saved: dag_run_id={dag_run_id} pod={pod_name}")
+        logger.info(
+            f"✓ Serving job saved: dag_run_id={dag_run_id} "
+            f"deployment={pod_name} replicas={replicas} hpa={hpa_enabled}"
+        )
     finally:
         conn.close()
 
@@ -316,10 +398,15 @@ with DAG(
     tags=["serving", "mlflow"],
 ) as dag:
 
-    researcher_id = "{{ dag_run.conf['researcher_id'] }}"
-    model_name    = "{{ dag_run.conf['model_name'] }}"
-    version       = "{{ dag_run.conf.get('version', 'latest') }}"
-    threshold     = "{{ dag_run.conf.get('threshold', 0.0) }}"
+    researcher_id    = "{{ dag_run.conf['researcher_id'] }}"
+    model_name       = "{{ dag_run.conf['model_name'] }}"
+    version          = "{{ dag_run.conf.get('version', 'latest') }}"
+    threshold        = "{{ dag_run.conf.get('threshold', 0.0) }}"
+    replicas         = "{{ dag_run.conf.get('replicas', 1) }}"
+    hpa_enabled      = "{{ dag_run.conf.get('hpa_enabled', False) }}"
+    hpa_min_replicas = "{{ dag_run.conf.get('hpa_min_replicas', 1) }}"
+    hpa_max_replicas = "{{ dag_run.conf.get('hpa_max_replicas', 5) }}"
+    hpa_cpu_target   = "{{ dag_run.conf.get('hpa_cpu_target', 70) }}"
 
     t1 = PythonOperator(
         task_id="validate_and_promote",
@@ -336,8 +423,13 @@ with DAG(
         task_id="deploy_serving_pod",
         python_callable=launch_and_wait_healthy,
         op_kwargs={
-            "researcher_id": researcher_id,
-            "model_name":    model_name,
+            "researcher_id":    researcher_id,
+            "model_name":       model_name,
+            "replicas":         replicas,
+            "hpa_enabled":      hpa_enabled,
+            "hpa_min_replicas": hpa_min_replicas,
+            "hpa_max_replicas": hpa_max_replicas,
+            "hpa_cpu_target":   hpa_cpu_target,
         },
     )
 
