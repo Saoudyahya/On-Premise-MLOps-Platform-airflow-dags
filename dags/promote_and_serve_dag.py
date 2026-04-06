@@ -179,19 +179,24 @@ def launch_and_wait_healthy(researcher_id, model_name,
         ],
         readiness_probe=k8s.V1Probe(
             http_get=k8s.V1HTTPGetAction(path="/v2/health/ready", port=8080),
-            initial_delay_seconds=30,
+            initial_delay_seconds=10,
             period_seconds=10,
             failure_threshold=12,
         ),
         liveness_probe=k8s.V1Probe(
             http_get=k8s.V1HTTPGetAction(path="/v2/health/live", port=8080),
-            initial_delay_seconds=60,
+            initial_delay_seconds=10,
             period_seconds=15,
             failure_threshold=6,
         ),
+        startup_probe=k8s.V1Probe(
+            http_get=k8s.V1HTTPGetAction(path="/v2/health/live", port=8080),
+            failure_threshold=60,
+            period_seconds=10,
+        ),
         resources=k8s.V1ResourceRequirements(
             requests={"memory": "512Mi", "cpu": "250m"},
-            limits={"memory": "2Gi",   "cpu": "1000m"},
+            limits={"memory": "2Gi", "cpu": "1000m"},
         ),
     )
 
