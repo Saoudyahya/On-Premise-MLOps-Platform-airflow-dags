@@ -347,6 +347,15 @@ def launch_and_wait_healthy(researcher_id, model_name,
     raise TimeoutError(f"Deployment {deploy_name} did not reach Ready state within 10 minutes")
 
 def save_serving_job_to_db(researcher_id, model_name, **ctx):
+    import psycopg2  # ← missing import
+
+    # ── DB connection vars (were never defined) ──────────────────────────────
+    db_host = os.environ.get("MLFLOW_DB_HOST", "mlflow-postgresql-svc.mlops-mlflow.svc.cluster.local")
+    db_port = os.environ.get("MLFLOW_DB_PORT", "5432")
+    db_name = os.environ.get("MLFLOW_DB_NAME", "mlflow")
+    db_user = os.environ.get("MLFLOW_DB_USER", "mlflow")
+    db_pass = os.environ.get("MLFLOW_DB_PASSWORD", "mlflow-password")
+
     ti             = ctx["ti"]
     pod_name       = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")
     svc_name       = ti.xcom_pull(task_ids="deploy_serving_pod", key="svc_name")
@@ -359,9 +368,11 @@ def save_serving_job_to_db(researcher_id, model_name, **ctx):
     hpa_max        = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_max_replicas")
     hpa_cpu        = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_cpu_target")
 
-    conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
-                            user=db_user, password=db_pass, connect_timeout=10,
-                            options="-c lc_messages=C")
+    conn = psycopg2.connect(
+        host=db_host, port=db_port, dbname=db_name,
+        user=db_user, password=db_pass, connect_timeout=10,
+        options="-c lc_messages=C",
+    )
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -386,9 +397,10 @@ def save_serving_job_to_db(researcher_id, model_name, **ctx):
                   pod_name, svc_name, serving_url,
                   replicas, hpa_enabled, hpa_min, hpa_max, hpa_cpu))
         conn.commit()
+        logger.info("✅ serving job saved to DB for dag_run_id=%s", dag_run_id)
     finally:
         conn.close()
-
+        
 with DAG(
     dag_id="serve_model_dag",
     default_args={"owner": "mlops", "retries": 1},
