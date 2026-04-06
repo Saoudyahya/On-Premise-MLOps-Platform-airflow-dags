@@ -346,55 +346,48 @@ def launch_and_wait_healthy(researcher_id, model_name,
 
     raise TimeoutError(f"Deployment {deploy_name} did not reach Ready state within 10 minutes")
 
-
 def save_serving_job_to_db(researcher_id, model_name, **ctx):
-    """Persist the serving job to the MLflow PostgreSQL DB so the UI can list it."""
-    import psycopg2
+    ti             = ctx["ti"]
+    pod_name       = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")
+    svc_name       = ti.xcom_pull(task_ids="deploy_serving_pod", key="svc_name")
+    serving_url    = ti.xcom_pull(task_ids="deploy_serving_pod", key="serving_url")
+    dag_run_id     = ctx["dag_run"].run_id
+    version        = ti.xcom_pull(task_ids="validate_and_promote", key="model_version") or "latest"
+    replicas       = ti.xcom_pull(task_ids="deploy_serving_pod", key="replicas") or 1
+    hpa_enabled    = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_enabled") or False
+    hpa_min        = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_min_replicas")
+    hpa_max        = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_max_replicas")
+    hpa_cpu        = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_cpu_target")
 
-    ti          = ctx["ti"]
-    pod_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="pod_name")    # deployment name
-    svc_name    = ti.xcom_pull(task_ids="deploy_serving_pod", key="svc_name")
-    serving_url = ti.xcom_pull(task_ids="deploy_serving_pod", key="serving_url")
-    dag_run_id  = ctx["dag_run"].run_id
-    version     = ti.xcom_pull(task_ids="validate_and_promote", key="model_version") or "latest"
-    replicas    = ti.xcom_pull(task_ids="deploy_serving_pod", key="replicas") or 1
-    hpa_enabled = ti.xcom_pull(task_ids="deploy_serving_pod", key="hpa_enabled") or False
-
-    db_host = os.environ.get("MLFLOW_DB_HOST", "mlflow-postgresql-svc.mlops-mlflow.svc.cluster.local")
-    db_port = os.environ.get("MLFLOW_DB_PORT", "5432")
-    db_name = os.environ.get("MLFLOW_DB_NAME", "mlflow")
-    db_user = os.environ.get("MLFLOW_DB_USER", "mlflow")
-    db_pass = os.environ.get("MLFLOW_DB_PASSWORD", "mlflow-password")
-
-    conn = psycopg2.connect(
-        host=db_host, port=db_port, dbname=db_name,
-        user=db_user, password=db_pass, connect_timeout=10,
-        options="-c lc_messages=C",
-    )
+    conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
+                            user=db_user, password=db_pass, connect_timeout=10,
+                            options="-c lc_messages=C")
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO researcher_serving_jobs
                     (researcher_id, model_name, version, dag_run_id,
-                     pod_name, svc_name, state, ready, serving_url)
-                VALUES (%s, %s, %s, %s, %s, %s, 'success', true, %s)
+                     pod_name, svc_name, state, ready, serving_url,
+                     replicas, hpa_enabled, hpa_min_replicas, hpa_max_replicas, hpa_cpu_target)
+                VALUES (%s, %s, %s, %s, %s, %s, 'success', true, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (dag_run_id) DO UPDATE
-                    SET state       = 'success',
-                        ready       = true,
-                        pod_name    = EXCLUDED.pod_name,
-                        svc_name    = EXCLUDED.svc_name,
-                        serving_url = EXCLUDED.serving_url,
-                        updated_at  = NOW()
+                    SET state            = 'success',
+                        ready            = true,
+                        pod_name         = EXCLUDED.pod_name,
+                        svc_name         = EXCLUDED.svc_name,
+                        serving_url      = EXCLUDED.serving_url,
+                        replicas         = EXCLUDED.replicas,
+                        hpa_enabled      = EXCLUDED.hpa_enabled,
+                        hpa_min_replicas = EXCLUDED.hpa_min_replicas,
+                        hpa_max_replicas = EXCLUDED.hpa_max_replicas,
+                        hpa_cpu_target   = EXCLUDED.hpa_cpu_target,
+                        updated_at       = NOW()
             """, (researcher_id, model_name, version, dag_run_id,
-                  pod_name, svc_name, serving_url))
+                  pod_name, svc_name, serving_url,
+                  replicas, hpa_enabled, hpa_min, hpa_max, hpa_cpu))
         conn.commit()
-        logger.info(
-            f"✓ Serving job saved: dag_run_id={dag_run_id} "
-            f"deployment={pod_name} replicas={replicas} hpa={hpa_enabled}"
-        )
     finally:
         conn.close()
-
 
 with DAG(
     dag_id="serve_model_dag",
